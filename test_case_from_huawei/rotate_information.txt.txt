@@ -1,0 +1,11 @@
+enum class CoordRotation {
+    UNDEFINE = -1,          // Undefine.
+    ROTATION_R0 = 0,        // No rotate.
+    ROTATION_R180 = 1,      // Rotate 180 degree in counterclockwise.
+    ROTATION_R90 = 2,       // Rotate 90 degree in counterclockwise.
+    ROTATION_R270 = 3,      // Rotate 270 degree in counterclockwise.
+    ROTATION_MY = 4,        // Flip symmetrically along Y-axis.
+    ROTATION_MX = 5,        // Flip symmetrically along X-axis.
+    ROTATION_MX90 = 6,      // Rotate 90 degree in counterclockwise after flip symmetrically along X-axis.
+    ROTATION_MY90 = 7       // Rotate 90 degree in counterclockwise after flip symmetrically along Y-axis.
+};
