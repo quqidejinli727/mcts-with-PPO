@@ -1,7 +1,0 @@
-{
-  "hidden_dim": 1024,
-  "num_residual_blocks": 4,
-  "state_dim": 2772,
-  "action_dim": 32,
-  "enhanced_architecture": true
-}
