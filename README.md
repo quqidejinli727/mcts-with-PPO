@@ -1,13 +1,54 @@
-# mcts-with-PPO
-下载后先将 src_version v3-1 文件夹解压到原位置
+# Feedthrough Evaluation
 
-##### 使用方法
-###### 1.模型训练
-- 直接执行src_version 文件中的 ppo_training.py 文件，模型参数存储在trained_models文件夹下
-- 训练前需更改case的路径，源文件中使用绝对路径，在ppo_trainging文件的763行，其他训练参数也在同一个函数中
-###### 2.执行模拟
-- 直接执行src_version 文件中的 simple_search_with_models.py 文件，输出结果存储在src_version文件夹下
-- 参数修改(包括文件路径)在37行的CONFIG中修改，模型文件、数据文件、feedthrough预测器路径均在当中
-###### 3.输出结果
-- net_results依照test_case中的pin_group文件中的net顺序一一对应，每个assignments是一个net的分配结果，pin顺序也保持一致；seg_coords是当前pin分配的segment位置信息，x1和y1为以及x2和y2分别为该段头尾坐标，midpoint为中点
-- 当前输出结果未针对复用模块进行硬约束，并且因为模型结果不好会有大量的复用pin位置可分配位置冲突，这一点在模型优化后仍是不可避免的，输出的pin位置仍会有部分冲突
+本项目用于对布局结果进行评估，输出：
+
+- 全部 nets 的 `Total HPWL`
+- 全部可计算 nets 的 `Total Feedthrough`
+
+当前主要入口脚本为 `evaluate.py`。
+
+## 目录结构
+
+```text
+feedthrough/
+├─ evaluate.py
+├─ ftpred_loader.py
+├─ PlaceDB.py
+├─ build/
+│  └─ ftpred.exe
+└─ benchmark/
+   ├─ input/
+   │  ├─ block.json
+   │  └─ pingroup.json
+   └─ result/
+      └─ result.json
+```
+
+## 输入文件说明
+
+- `benchmark/input/block.json`：模块几何与层级信息
+- `benchmark/input/pingroup.json`：网表/引脚拓扑（原始）
+- `benchmark/result/result.json`：引脚最终坐标（`scope=[x,y]`）
+
+`evaluate.py` 会读取 `result.json` 计算 HPWL，并把坐标映射回 `PlaceDB` 后调用 `ftpred` 计算 feedthrough 总和。
+
+## 运行方式
+
+在项目根目录执行：
+
+```powershell
+py .\evaluate.py
+```
+
+也可以显式传参：
+
+```powershell
+py .\evaluate.py .\benchmark\result\result.json .\benchmark\input\block.json .\benchmark\input\pingroup.json .\build\ftpred.exe
+```
+
+## 输出示例
+
+程序会输出类似：
+
+- `Total HPWL = ...`
+- `Total Feedthrough = ...`
