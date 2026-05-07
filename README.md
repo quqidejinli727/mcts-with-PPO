@@ -1,6 +1,16 @@
 # HUAWEI
 ## MCTS
-
+### 使用方法
+- 执行 complete_mcts_pipeline.py 文件中的 main 函数
+- 传入参数：
+  block_file:block 文件路径
+  pingroup_file：网表文件路径
+  num_simulations 单个net mcts模拟次数
+  time_limit: 单个net mcts模拟时间上限
+部分参数配置受 multi_net_isomorphic_mcts 中19行 MCTSConfig限制，见complete_mcts_pipeline.py文件224行
+文件路径建议使用绝对路径
+### 文件输出
+在 src 文件同一级目录下产生文件夹mcts_result,其中final_result中存储的是最后输出文件，按segment排列，具体见segment_assignments_README
 ## Feedthrough Evaluation
 
 本项目用于对布局结果进行评估，输出：
