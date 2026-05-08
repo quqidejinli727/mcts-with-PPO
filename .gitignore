@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+output/
+*.log
+stage1_mcts/feedthrough/build/
+stage1_mcts/feedthrough/etc/
