@@ -16,6 +16,12 @@ _STAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 if _STAGE_DIR not in sys.path:
     sys.path.insert(0, _STAGE_DIR)
 
+# Stage 1 和 Stage 2 都有同名模块（PlaceDB、Params 等），Stage 1 运行后这些模块
+# 已被缓存在 sys.modules 中。必须先清除缓存，确保 Stage 2 从自己的目录重新加载。
+_STAGE2_MODULES = ["PlaceDB", "Params", "PlaceObj", "EdgePlace", "NonLinearPlace"]
+for _mod in _STAGE2_MODULES:
+    sys.modules.pop(_mod, None)
+
 
 def run_nlplace(
     segment_assignments_path: str,
