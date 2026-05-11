@@ -7,8 +7,8 @@ Inputs:
 
 Outputs:
   - result_legalized.json
-  - qp_json_legalization_report.txt
-  - pin_positions_legalized_flat.json, unless WRITE_FLAT_OUTPUT=0
+  - pin_positions_legalized_flat.json, only when WRITE_FLAT_OUTPUT=1
+  - qp_json_legalization_report.txt, only when WRITE_REPORT_OUTPUT=1
 
 Recommended stable defaults are set below via os.environ.setdefault(...).
 Override them from the shell before running when needed.
@@ -39,21 +39,89 @@ os.environ.setdefault("TRIAL_FAIL_CACHE_LIMIT", "200000")
 os.environ.setdefault("STRICT_PAIR_HPWL_GATE", "1")
 os.environ.setdefault("PAIR_HPWL_GATE_MARGIN", "0.0")
 os.environ.setdefault("HPWL_GATE_DEBUG", "0")
+# Width-pressure admission heuristic. Wide/tight candidate pairs are tried first.
+os.environ.setdefault("ADMISSION_WIDTH_PRIORITY", "0")
+os.environ.setdefault("COMPONENT_FALLBACK_POLICY", "nearest_fixed_axis")
+os.environ.setdefault("FOLLOWER_ANCHOR_CLOSURE", "1")
 os.environ.setdefault("LOCAL_FIXEDPOINT_ITERS", "1")
+# Adaptive fast-first mode: keep the ordinary outer loop close to the old fast
+# path; enter required-closure / policy target-order rescue only if final
+# report-style blockers remain.
+os.environ.setdefault("ADAPTIVE_STRICT_CLOSURE", "1")
+os.environ.setdefault("FINAL_RESCUE_COUNT_GATE", "1")
 # Keep coarse [inner] progress on by default; detailed solver/admission logs remain debug-only.
 os.environ.setdefault("SOLVER_DEBUG_LOG", "0")
 os.environ.setdefault("SOLVER_PROGRESS_LOG", "1")
-# Control whether pin_positions_legalized_flat.json is written. Set WRITE_FLAT_OUTPUT=0 to skip it.
-os.environ.setdefault("WRITE_FLAT_OUTPUT", "0")
+# Control optional outputs.
+os.environ.setdefault("WRITE_FLAT_OUTPUT", "1")
 os.environ.setdefault("WRITE_REPORT_OUTPUT", "0")
+# Print true same-axis blocker details after excluding cross-axis, pair-empty,
+# and component-empty edges intentionally dropped by nearest-fixed-axis policy.
+os.environ.setdefault("ALIGN_BLOCKER_REPORT", "1")
+os.environ.setdefault("ALIGN_BLOCKER_LIMIT", "50")
+# Generic final residual rescue. No module-specific names are used.
+os.environ.setdefault("FINAL_RESCUE_ENABLE", "1")
+os.environ.setdefault("FINAL_RESCUE_ROUNDS", "2")
+os.environ.setdefault("FINAL_RESCUE_SEARCH_CAP", "10")
+os.environ.setdefault("FINAL_RESCUE_SWAP_CAP", "3")
+os.environ.setdefault("FINAL_RESCUE_REMOVAL_POOL_CAP", "32")
+os.environ.setdefault("FINAL_RESCUE_BEAM_WIDTH", "128")
+os.environ.setdefault("FINAL_RESCUE_GLOBAL_SWAP", "1")
+# Accept final-rescue mutations only when the final residual score improves.
+os.environ.setdefault("FINAL_RESCUE_SCORE_ACCEPT", "1")
+os.environ.setdefault("FINAL_RESCUE_SCORE_MODE", "count_total_max")
+# Diagnostic-only bounded minimum-removal search for remaining blockers.
+os.environ.setdefault("FINAL_BLOCKER_DIAGNOSE", "1")
+os.environ.setdefault("FINAL_BLOCKER_DIAG_LIMIT", "50")
+os.environ.setdefault("FINAL_BLOCKER_DIAG_MAX_REMOVE", "3")
+os.environ.setdefault("FINAL_BLOCKER_DIAG_POOL_CAP", "24")
+os.environ.setdefault("FINAL_BLOCKER_DIAG_BEAM_WIDTH", "128")
+# Admission-layer score/replacement. This uses the same true-blocker objective
+# as final rescue during ordinary family admission.
+os.environ.setdefault("ADMISSION_SCORE_ACCEPT", "0")
+os.environ.setdefault("ADMISSION_REPLACEMENT_ENABLE", "0")
+os.environ.setdefault("ADMISSION_REPLACEMENT_MAX_REMOVE", "3")
+os.environ.setdefault("ADMISSION_REPLACEMENT_POOL_CAP", "24")
+os.environ.setdefault("ADMISSION_REPLACEMENT_BEAM_WIDTH", "64")
+
+# Required-edge hard closure: after ordinary admission/rescue, every actionable same-axis
+# residual is either committed as a hard equality / follower-anchor equality, or reported
+# as infeasible under bounded replacement.
+os.environ.setdefault("REQUIRED_HARD_CLOSURE_ENABLE", "1")
+os.environ.setdefault("REQUIRED_HARD_CLOSURE_ROUNDS", "5")
+os.environ.setdefault("REQUIRED_HARD_CLOSURE_MAX_REMOVE", "3")
+os.environ.setdefault("REQUIRED_HARD_CLOSURE_POOL_CAP", "32")
+os.environ.setdefault("REQUIRED_HARD_CLOSURE_BEAM_WIDTH", "128")
+
+# Policy-blocked reference-master edges: first try component-level plan B; if a component cannot be fully anchored, keep the HPWL-shortest edge.
+os.environ.setdefault("POLICY_TARGET_FREEZE_BOTH", "1")
+os.environ.setdefault("POLICY_TARGET_TRY_MIDPOINT", "1")
+os.environ.setdefault("POLICY_COMPONENT_FALLBACK_POLICY", "min_hpwl")
+# Policy component fallback tries candidates in HPWL order, but never tries candidates above this limit.
+os.environ.setdefault("POLICY_COMPONENT_FALLBACK_HPWL_LIMIT", "500")
+# Final rescue for the representative low-HPWL policy blockers that remain after required closure.
+os.environ.setdefault("POLICY_MIN_EDGE_CONFLICT_REPLACE_ENABLE", "1")
+os.environ.setdefault("POLICY_MIN_EDGE_CONFLICT_REPLACE_ROUNDS", "3")
+os.environ.setdefault("POLICY_MIN_EDGE_CONFLICT_REPLACE_MAX_REMOVE", "3")
+os.environ.setdefault("POLICY_MIN_EDGE_CONFLICT_REPLACE_POOL_CAP", "32")
+os.environ.setdefault("POLICY_MIN_EDGE_CONFLICT_REPLACE_BEAM_WIDTH", "128")
+# Final policy representative rescue: scan candidate scalar targets and rebuild
+# order/no-overlap constraints around each target before declaring infeasible.
+os.environ.setdefault("POLICY_MIN_EDGE_TARGET_SCAN_ENABLE", "1")
+os.environ.setdefault("POLICY_MIN_EDGE_TARGET_SCAN_POINTS", "17")
+os.environ.setdefault("POLICY_MIN_EDGE_TARGET_ORDER_HINT", "1")
+os.environ.setdefault("POLICY_MIN_EDGE_ALIAS_REMOVAL_ENABLE", "1")
+os.environ.setdefault("POLICY_MIN_EDGE_CONFLICT_VERBOSE", "0")
+os.environ.setdefault("POLICY_MIN_EDGE_CONFLICT_DETAIL_LIMIT", "0")
 
 from PlaceDB import PlaceDB
-from pin_legalizer import (
-    solve_global_qp_with_outer_order_update,
-    extract_real_segments,
-)
+import pin_legalizer as _solver_mod
 
-REPORT_PATH = Path(__file__).with_name("qp_json_legalization_report.txt")
+solve_global_qp_with_outer_order_update = _solver_mod.solve_global_qp_with_outer_order_update
+extract_real_segments = _solver_mod.extract_real_segments
+
+
+REPORT_PATH = Path(__file__).with_name("pin_legalizer_report.txt")
 DEFAULT_BLOCK = "block.json"
 DEFAULT_PINGROUP = "pingroup.json"
 DEFAULT_RESULT = "result.json"
@@ -206,11 +274,74 @@ def _parse_successor_key(s: str):
     return (inst, pname)
 
 
-def _successor_alignment_report(result_out, flat_lookup, hpwl_thresh: float, tol: float):
-    total = 0
-    low = 0
-    aligned = 0
-    misaligned = []
+def _make_segment_lookup(all_real_segments):
+    lookup = {}
+    for inst, segs in all_real_segments.items():
+        for seg in segs:
+            lookup[tuple(seg.id)] = seg
+    return lookup
+
+
+def _flat_interval(fp, seg_lookup, keepout: float):
+    seg_id_raw = fp.get("seg_id", [])
+    if not isinstance(seg_id_raw, (list, tuple)) or len(seg_id_raw) != 2:
+        return None
+    seg = seg_lookup.get(tuple(seg_id_raw))
+    if seg is None:
+        return None
+    width = float(fp.get("width", 0.0))
+    return (float(seg.lo) + float(keepout) + 0.5 * width,
+            float(seg.hi) - float(keepout) - 0.5 * width)
+
+
+def _successor_alignment_report(result_out, flat_lookup, all_real_segments, keepout: float, hpwl_thresh: float, tol: float, policy_dropped_edge_keys=None):
+    """Report alignment with the production semantics.
+
+    Count as alignable only if:
+      - final HPWL < threshold;
+      - both endpoints have the same free_axis;
+      - the two endpoint legal scalar intervals intersect.
+
+    Cross-axis and pair-empty cases are skipped rather than counted as
+    misaligned because they are not valid same-axis hard-align targets.
+
+    Component-empty cases are diagnosed separately. When a component has no
+    common scalar intersection, the solver intentionally keeps one edge by the
+    nearest-fixed-axis policy and drops the rest from the ordinary misaligned
+    count. Those dropped edges are reported as component_empty_dropped_by_policy.
+    """
+    seg_lookup = _make_segment_lookup(all_real_segments)
+    policy_dropped_edge_keys = set(policy_dropped_edge_keys or [])
+    stats = {
+        "successor_edges": 0,
+        "low_hpwl_total": 0,
+        "cross_axis_low_hpwl_skipped": 0,
+        "same_axis_low_hpwl": 0,
+        "same_axis_pair_empty_skipped": 0,
+        "same_axis_evaluable": 0,
+        "same_axis_aligned": 0,
+        "same_axis_misaligned_raw": 0,
+        "same_axis_misaligned": 0,
+        "true_same_axis_misaligned": 0,
+        "component_empty_count": 0,
+        "component_empty_edges": 0,
+        "component_empty_kept_by_policy": 0,
+        "component_empty_dropped_by_policy": 0,
+        "component_empty_dropped_misaligned": 0,
+        "policy_component_dropped_by_policy": 0,
+        "policy_component_dropped_misaligned": 0,
+    }
+    misaligned_raw = []
+    pair_empty = []
+    comp_edges = []
+
+    def _fixed_axis_distance_from_scopes(axis, ascope, bscope):
+        if axis == "x":
+            return abs(float(ascope[1]) - float(bscope[1]))
+        if axis == "y":
+            return abs(float(ascope[0]) - float(bscope[0]))
+        return float("inf")
+
     for net in result_out:
         for pin in net:
             akey = (pin.get("parent_inst", ""), pin.get("pingroup_name", ""))
@@ -224,25 +355,162 @@ def _successor_alignment_report(result_out, flat_lookup, hpwl_thresh: float, tol
                 bf = flat_lookup.get(bkey)
                 if bf is None:
                     continue
-                total += 1
+                stats["successor_edges"] += 1
                 ax, ay = map(float, af["scope"])
                 bx, by = map(float, bf["scope"])
                 hpwl = abs(ax - bx) + abs(ay - by)
-                if hpwl < hpwl_thresh:
-                    low += 1
-                    if af.get("free_axis") == bf.get("free_axis") == "x":
-                        delta = abs(ax - bx)
-                    elif af.get("free_axis") == bf.get("free_axis") == "y":
-                        delta = abs(ay - by)
-                    else:
-                        delta = hpwl
-                    if delta <= tol:
-                        aligned += 1
-                    else:
-                        misaligned.append((delta, hpwl, akey, bkey))
-    misaligned.sort(reverse=True, key=lambda x: x[0])
-    return total, low, aligned, misaligned
+                if hpwl >= hpwl_thresh:
+                    continue
+                stats["low_hpwl_total"] += 1
 
+                fa, fb = af.get("free_axis"), bf.get("free_axis")
+                if fa != fb or fa not in {"x", "y"}:
+                    stats["cross_axis_low_hpwl_skipped"] += 1
+                    continue
+                stats["same_axis_low_hpwl"] += 1
+
+                ia = _flat_interval(af, seg_lookup, keepout)
+                ib = _flat_interval(bf, seg_lookup, keepout)
+                if ia is None or ib is None:
+                    stats["same_axis_pair_empty_skipped"] += 1
+                    continue
+                lo = max(float(ia[0]), float(ib[0]))
+                hi = min(float(ia[1]), float(ib[1]))
+                if lo > hi + 1e-9:
+                    stats["same_axis_pair_empty_skipped"] += 1
+                    pair_empty.append({
+                        "gap": lo - hi,
+                        "hpwl": hpwl,
+                        "axis": fa,
+                        "akey": akey,
+                        "bkey": bkey,
+                        "lo": lo,
+                        "hi": hi,
+                    })
+                    continue
+
+                stats["same_axis_evaluable"] += 1
+                delta = abs(ax - bx) if fa == "x" else abs(ay - by)
+                fixed_axis_dist = _fixed_axis_distance_from_scopes(fa, af["scope"], bf["scope"])
+                rec = {
+                    "edge_key": (akey, bkey),
+                    "akey": akey,
+                    "bkey": bkey,
+                    "axis": fa,
+                    "ia": ia,
+                    "ib": ib,
+                    "lo": lo,
+                    "hi": hi,
+                    "slack": hi - lo,
+                    "hpwl": hpwl,
+                    "delta": delta,
+                    "fixed_axis_distance": fixed_axis_dist,
+                    "a_width": float(af.get("width", 0.0)),
+                    "b_width": float(bf.get("width", 0.0)),
+                    "a_scope": tuple(map(float, af.get("scope", [0.0, 0.0]))),
+                    "b_scope": tuple(map(float, bf.get("scope", [0.0, 0.0]))),
+                }
+                comp_edges.append(rec)
+                if delta <= tol:
+                    stats["same_axis_aligned"] += 1
+                else:
+                    stats["same_axis_misaligned_raw"] += 1
+                    misaligned_raw.append(rec)
+
+    # Component-level interval diagnosis for same-axis pair-feasible edges.
+    parent = {}
+    node_axis = {}
+    node_iv = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for rec in comp_edges:
+        akey = rec["akey"]
+        bkey = rec["bkey"]
+        axis = rec["axis"]
+        union(akey, bkey)
+        node_axis[akey] = axis
+        node_axis[bkey] = axis
+        node_iv[akey] = rec["ia"]
+        node_iv[bkey] = rec["ib"]
+
+    comps = {}
+    for n in parent:
+        comps.setdefault(find(n), []).append(n)
+
+    component_empty_dropped_edge_keys = set()
+    component_empty_dropped = []
+    for nodes in comps.values():
+        if len(nodes) <= 2:
+            continue
+        axes = {node_axis.get(n) for n in nodes}
+        if len(axes) != 1:
+            continue
+        lo = max(float(node_iv[n][0]) for n in nodes if n in node_iv)
+        hi = min(float(node_iv[n][1]) for n in nodes if n in node_iv)
+        if lo <= hi + 1e-9:
+            continue
+
+        nset = set(nodes)
+        edges = [rec for rec in comp_edges if rec["akey"] in nset and rec["bkey"] in nset]
+        if not edges:
+            continue
+        stats["component_empty_count"] += 1
+        stats["component_empty_edges"] += len(edges)
+
+        # Match the solver-side component fallback policy.
+        policy = os.environ.get("COMPONENT_FALLBACK_POLICY", "nearest_fixed_axis").strip().lower()
+        if policy in {"nearest", "nearest_fixed", "nearest_fixed_axis", "fixed_axis"}:
+            kept = min(edges, key=lambda r: (r["fixed_axis_distance"], r["hpwl"], str(r["edge_key"])))
+        elif policy in {"hpwl", "shortest", "shortest_hpwl"}:
+            kept = min(edges, key=lambda r: (r["hpwl"], str(r["edge_key"])))
+        elif policy in {"width", "wide"}:
+            kept = min(edges, key=lambda r: (-max(r["a_width"], r["b_width"]), r["hpwl"], str(r["edge_key"])))
+        else:
+            kept = min(edges, key=lambda r: (
+                -max(r["a_width"], r["b_width"]) / max(r["slack"], 1e-6),
+                -max(r["a_width"], r["b_width"]),
+                r["slack"],
+                r["hpwl"],
+                str(r["edge_key"]),
+            ))
+        stats["component_empty_kept_by_policy"] += 1
+        for rec in edges:
+            if rec is kept:
+                continue
+            component_empty_dropped_edge_keys.add(rec["edge_key"])
+            component_empty_dropped.append({**rec, "component_lo": lo, "component_hi": hi, "component_gap": lo - hi})
+            stats["component_empty_dropped_by_policy"] += 1
+
+    true_misaligned = []
+    for rec in misaligned_raw:
+        norm_edge_key = rec["edge_key"] if rec["edge_key"][0] <= rec["edge_key"][1] else (rec["edge_key"][1], rec["edge_key"][0])
+        if rec["edge_key"] in component_empty_dropped_edge_keys:
+            stats["component_empty_dropped_misaligned"] += 1
+        elif norm_edge_key in policy_dropped_edge_keys:
+            stats["policy_component_dropped_misaligned"] += 1
+        else:
+            true_misaligned.append(rec)
+
+    stats["policy_component_dropped_by_policy"] = len(policy_dropped_edge_keys)
+    stats["true_same_axis_misaligned"] = len(true_misaligned)
+    # Preserve the old key name, but make it the actionable count after removing
+    # component-empty edges intentionally dropped by nearest policy.
+    stats["same_axis_misaligned"] = len(true_misaligned)
+
+    true_misaligned.sort(reverse=True, key=lambda r: r["delta"])
+    component_empty_dropped.sort(reverse=True, key=lambda r: r["delta"])
+    pair_empty.sort(reverse=True, key=lambda r: r["gap"])
+    return stats, true_misaligned, pair_empty, component_empty_dropped
 
 def _no_overlap_report(flat_results, keepout: float, tol: float):
     by_seg = {}
@@ -285,12 +553,9 @@ def _displacement_report(flat_lookup, result_lookup):
     return mean_manhattan, vals[0][0], vals[:10]
 
 def main():
-    # block_json = os.environ.get("BLOCK_JSON", DEFAULT_BLOCK)
-    # pingroup_json = os.environ.get("PINGROUP_JSON", DEFAULT_PINGROUP)
-    # result_json = os.environ.get("RESULT_JSON", DEFAULT_RESULT)
-    block_json = r"benchmark\case2\block.json"
-    pingroup_json = r"benchmark\case2\pingroup.json"
-    result_json = r"benchmark\result\case2\result.json"
+    block_json = os.environ.get("BLOCK_JSON", DEFAULT_BLOCK)
+    pingroup_json = os.environ.get("PINGROUP_JSON", DEFAULT_PINGROUP)
+    result_json = os.environ.get("RESULT_JSON", DEFAULT_RESULT)
     output_json = os.environ.get("OUTPUT_JSON", DEFAULT_OUTPUT)
     flat_output_json = os.environ.get("FLAT_OUTPUT_JSON", DEFAULT_FLAT_OUTPUT)
     keepout = float(os.environ.get("KEEP_OUT", str(DEFAULT_KEEP_OUT)))
@@ -298,7 +563,7 @@ def main():
     max_outer_iter = int(os.environ.get("MAX_OUTER_ITER", str(DEFAULT_MAX_OUTER_ITER)))
     tol = float(os.environ.get("TOL", str(DEFAULT_TOL)))
     enable_hard_iso = os.environ.get("ENABLE_HARD_ISO", "1" if DEFAULT_ENABLE_HARD_ISO else "0").strip() not in {"0", "false", "False", "no", "NO"}
-    write_flat_output = os.environ.get("WRITE_FLAT_OUTPUT", "0").strip() not in {"0", "false", "False", "no", "NO"}
+    write_flat_output = os.environ.get("WRITE_FLAT_OUTPUT", "1").strip() not in {"0", "false", "False", "no", "NO"}
     write_report_output = os.environ.get("WRITE_REPORT_OUTPUT", "0").strip() not in {"0", "false", "False", "no", "NO"}
 
     print(f"Loading PlaceDB from {block_json} and {pingroup_json}...")
@@ -342,7 +607,8 @@ def main():
     if not active_pins:
         raise RuntimeError("No active pins were initialized from result.json")
 
-    print("Running QP Pin Legalizer (successor HPWL-triggered hard alignment)...")
+    print("Running pin_legalizer...")
+    print("[version] solver=hpwl500-adaptive-fast-target-order")
     final_state, all_real_segments = solve_global_qp_with_outer_order_update(
         all_modules=db.all_modules_list,
         active_pins=active_pins,
@@ -363,17 +629,44 @@ def main():
     report_lines.append(f"updated_result_entries: {updated_count}")
     report_lines.append(f"unchanged_result_entries: {unchanged_count}")
 
-    succ_total, succ_low, succ_aligned, succ_misaligned = _successor_alignment_report(
-        result_out, flat_lookup, hpwl_thresh=hpwl_thresh, tol=tol
+    policy_dropped_edge_keys = getattr(_solver_mod, "LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS", set())
+    succ_stats, succ_misaligned, succ_pair_empty, succ_component_dropped = _successor_alignment_report(
+        result_out, flat_lookup, all_real_segments, keepout=keepout, hpwl_thresh=hpwl_thresh, tol=tol,
+        policy_dropped_edge_keys=policy_dropped_edge_keys,
     )
     noov = _no_overlap_report(flat_results, keepout=keepout, tol=tol)
     disp_mean, disp_max, disp_top = _displacement_report(flat_lookup, result_lookup)
-    print(f"[report] successor_edges={succ_total} final_hpwl_lt_{hpwl_thresh:g}={succ_low} aligned_tol={succ_aligned} misaligned={succ_low - succ_aligned}")
-    print(f"[report] no_overlap_violations={len(noov)}")
-    report_lines.append(f"final_successor_edges_total: {succ_total}")
-    report_lines.append(f"final_successor_edges_hpwl_lt_{hpwl_thresh:g}: {succ_low}")
-    report_lines.append(f"final_successor_edges_aligned_tol_{tol:g}: {succ_aligned}")
-    report_lines.append(f"final_successor_edges_misaligned_tol_{tol:g}: {succ_low - succ_aligned}")
+
+    # User-facing result summary.  Keep the old solver's terse style: progress
+    # lines during optimization, then a compact final result.  Internal categories
+    # such as component/policy drops remain available in the optional report file
+    # but are not printed by default.
+    skipped_non_actionable = (
+        succ_stats.get("cross_axis_low_hpwl_skipped", 0)
+        + succ_stats.get("same_axis_pair_empty_skipped", 0)
+        + succ_stats.get("component_empty_dropped_by_policy", 0)
+        + succ_stats.get("policy_component_dropped_by_policy", 0)
+    )
+    print(
+        f"[result] pins={len(final_state)} updated={updated_count} "
+        f"successor_edges={succ_stats['successor_edges']} low_hpwl={succ_stats['low_hpwl_total']}"
+    )
+    print(
+        f"[result] same_axis_evaluable={succ_stats['same_axis_evaluable']} "
+        f"aligned={succ_stats['same_axis_aligned']} misaligned={succ_stats['true_same_axis_misaligned']} "
+        f"skipped={skipped_non_actionable}"
+    )
+    print(f"[result] no_overlap_violations={len(noov)}")
+    print(f"[result] displacement_mean={disp_mean:.6f} displacement_max={disp_max:.6f}")
+
+    # Optional report, written only when WRITE_REPORT_OUTPUT=1.  Keep it compact
+    # and avoid exposing internal policy/drop category names.
+    report_lines.append(f"successor_edges: {succ_stats['successor_edges']}")
+    report_lines.append(f"low_hpwl: {succ_stats['low_hpwl_total']}")
+    report_lines.append(f"same_axis_evaluable: {succ_stats['same_axis_evaluable']}")
+    report_lines.append(f"aligned: {succ_stats['same_axis_aligned']}")
+    report_lines.append(f"misaligned: {succ_stats['true_same_axis_misaligned']}")
+    report_lines.append(f"skipped: {skipped_non_actionable}")
     report_lines.append(f"no_overlap_violations: {len(noov)}")
     for item in noov[:10]:
         report_lines.append(f"  no_overlap_violation: excess={item[0]:.6f} seg={item[1]} a={item[2]} b={item[3]} gap={item[4]:.6f} req={item[5]:.6f}")
@@ -381,8 +674,24 @@ def main():
     report_lines.append(f"displacement_max_manhattan: {disp_max:.6f}")
     for dman, dlinf, key in disp_top:
         report_lines.append(f"  displacement_top: manhattan={dman:.6f} linf={dlinf:.6f} key={key}")
-    for delta, hpwl, akey, bkey in succ_misaligned[:10]:
-        report_lines.append(f"  misaligned_low_hpwl: delta={delta:.6f} hpwl={hpwl:.6f} a={akey} b={bkey}")
+    for rec in succ_misaligned[:10]:
+        report_lines.append(
+            f"  blocker: delta={rec['delta']:.6f} hpwl={rec['hpwl']:.6f} "
+            f"axis={rec['axis']} slack={rec['slack']:.6f} "
+            f"a={rec['akey']} b={rec['bkey']}"
+        )
+
+    align_blocker_report = os.environ.get("ALIGN_BLOCKER_REPORT", "1").strip().lower() not in {"0", "false", "False", "no", "NO"}
+    align_blocker_limit = int(os.environ.get("ALIGN_BLOCKER_LIMIT", "50"))
+    if align_blocker_report and succ_misaligned:
+        shown = min(len(succ_misaligned), max(0, align_blocker_limit))
+        print(f"[blocker] count={len(succ_misaligned)} showing={shown}")
+        for idx, rec in enumerate(succ_misaligned[:shown], 1):
+            print(
+                f"[blocker] #{idx:02d} axis={rec['axis']} delta={rec['delta']:.6f} "
+                f"hpwl={rec['hpwl']:.6f} slack={rec['slack']:.6f} "
+                f"a={rec['akey']} b={rec['bkey']}"
+            )
 
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(result_out, f, indent=2)
