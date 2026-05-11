@@ -13,8 +13,22 @@ Core policy:
     hard-align equalities.
   - Initial result.json coordinates are used only as a weak soft anchor through
     MOVE_ANCHOR_WEIGHT.
-  - Candidate admission uses a dynamic HPWL gate and deterministic trial-failure
-    cache to avoid repeated infeasible GUROBI solves.
+  - Candidate admission uses a dynamic HPWL gate and deterministic
+    trial-failure cache to avoid repeated infeasible GUROBI solves.
+  - Cross-axis successor edges are not hard-aligned. Pair-level empty legal
+    interval intersections are skipped before admission.
+  - If several same-axis successor edges form a component whose common interval
+    is empty, keep one edge by nearest fixed-axis distance (for example GH to
+    the physically nearest GH1/GH2/GH3/GH4 leaf) instead of forcing the whole
+    component.
+  - Follower-side successor edges that would pull the master are not admitted
+    as ordinary equalities; optionally they are handled after the main solve by
+    follower-anchor closure: the follower endpoint stays fixed and the other
+    endpoint is pulled to that scalar coordinate if feasible.
+  - Final rescue can use local swap, but swap acceptance is guarded by a
+    residual-alignment score. Remaining blockers can be diagnosed by trying
+    direct insertion and bounded minimum-removal searches over nearby active
+    hard-pairs.
 
 Removed from this stable flow:
   - RRR rescue
@@ -32,6 +46,11 @@ import numpy as np
 import scipy.optimize as opt
 from collections import defaultdict
 from itertools import combinations
+
+# Exposed for run-script reporting: policy-blocked components that could not
+# be fully anchored may intentionally keep only the HPWL-shortest edge.
+LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS = set()
+LAST_POLICY_COMPONENT_DROPPED_RECORDS = []
 
 def _env_bool(name, default=False):
     v = os.environ.get(name)
@@ -1104,7 +1123,8 @@ def build_orders_hard_iso(groups, bucket_by_seg, hard_pairs, inst_pin_state, rea
 # ---------------- inner hard solver ----------------
 
 def solve_inner_qp_dummy(groups, inst_pin_state, orders, hard_pairs, enable_hard_iso=True,
-                         keepout=0.0, real_segments=None, prev_values=None, init_values=None):
+                         keepout=0.0, real_segments=None, prev_values=None, init_values=None,
+                         fixed_scalar_constraints=None):
     if cp is None:
         raise RuntimeError("CVXPY not available; cannot enforce hard constraints")
 
@@ -1144,6 +1164,8 @@ def solve_inner_qp_dummy(groups, inst_pin_state, orders, hard_pairs, enable_hard
 
     constraints = []
     eps = 1e-3
+    if fixed_scalar_constraints is None:
+        fixed_scalar_constraints = []
 
     _progress_print(f"[inner] hard_pairs: {len(list(hard_pairs))}, segments_in_orders: {len(orders)}")
 
@@ -1215,6 +1237,17 @@ def solve_inner_qp_dummy(groups, inst_pin_state, orders, hard_pairs, enable_hard
         if hp.pin_a in real_expr and hp.pin_b in real_expr:
             constraints.append(real_expr[hp.pin_a] == real_expr[hp.pin_b])
 
+    # Follower-anchor closure constraints. These are fixed-scalar constraints on
+    # only the movable endpoint; the follower endpoint is treated as an anchor
+    # and therefore cannot pull the master/template back through an equality.
+    for item in fixed_scalar_constraints:
+        try:
+            pin_key, target_s = item[0], float(item[1])
+        except Exception:
+            continue
+        if pin_key in real_expr:
+            constraints.append(real_expr[pin_key] == target_s)
+
     # Objective priority:
     #   1) Hard constraints above are non-negotiable: bounds, no-overlap/order, hard-align equality.
     #   2) Stay close to the previous accepted iterate, matching the original stable inner-QP behavior.
@@ -1248,30 +1281,23 @@ def solve_inner_qp_dummy(groups, inst_pin_state, orders, hard_pairs, enable_hard
     gurobi_verbose_retry = str(os.environ.get("GUROBI_VERBOSE_RETRY", "0")).strip().lower() not in {"0", "false", "no"}
 
     preferred_solvers = []
-    for s in ["GUROBI", "CLARABEL", "OSQP", "SCS"]:
-        if s in installed:
-            preferred_solvers.append(s)
+    if "GUROBI" in installed:
+        preferred_solvers.append("GUROBI")
     if not preferred_solvers:
-        raise RuntimeError("No supported CVXPY solver available (tried GUROBI, CLARABEL, OSQP, SCS)")
+        raise RuntimeError("GUROBI is not installed/visible to CVXPY for hard-constraint solve")
 
     solved = False
     last_err = None
     last_status = None
 
     def _acceptable(status):
-        return status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
-
-    _SOLVER_KWARGS = {
-        "GUROBI":   {"verbose": False, "reoptimize": True, "warm_start": True},
-        "CLARABEL": {"verbose": False},
-        "OSQP":     {"verbose": False, "warm_start": True, "max_iter": 10000, "eps_abs": 1e-6, "eps_rel": 1e-6},
-        "SCS":      {"verbose": False, "max_iters": 10000, "eps": 1e-6},
-    }
+        return status == cp.OPTIMAL
 
     for solver_name in preferred_solvers:
         try:
-            kwargs = _SOLVER_KWARGS.get(solver_name, {"verbose": False})
-            prob.solve(solver=getattr(cp, solver_name), **kwargs)
+            # v21 is GUROBI-only. CLARABEL / OSQP / SCS fallback paths were
+            # removed because the stable flow treats non-GUROBI fallback as abandoned.
+            prob.solve(solver=cp.GUROBI, verbose=False, reoptimize=True, warm_start=True)
             last_status = prob.status
             _debug_print(f"[inner] solver {solver_name} status {prob.status}")
             if _acceptable(prob.status):
@@ -1280,7 +1306,7 @@ def solve_inner_qp_dummy(groups, inst_pin_state, orders, hard_pairs, enable_hard
         except Exception as e:
             last_err = e
             _debug_print(f"[inner] solver {solver_name} exception {repr(e)}")
-            if solver_name == "GUROBI" and gurobi_verbose_retry:
+            if gurobi_verbose_retry:
                 try:
                     prob.solve(solver=cp.GUROBI, verbose=True, reoptimize=True, warm_start=True)
                     last_status = prob.status
@@ -1349,6 +1375,11 @@ def orders_equal(o1, o2):
 def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_nets, keepout,
                                             hpwl_thresh=500.0, max_outer_iter=5, tol=1e-3,
                                             enable_hard_iso=True):
+    global LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS, LAST_POLICY_COMPONENT_DROPPED_RECORDS
+    LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS = set()
+    LAST_POLICY_COMPONENT_DROPPED_RECORDS = []
+    policy_component_dropped_edge_keys = set()
+    policy_component_dropped_records = []
     module_map = {m.name: m for m in all_modules if getattr(m, "vertex", None)}
     real_segments = {m.name: extract_real_segments(m) for m in module_map.values()}
 
@@ -1412,15 +1443,164 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
     hpwl_gate_debug = str(os.environ.get("HPWL_GATE_DEBUG", "0")).strip().lower() not in {"0", "false", "no"}
     hpwl_gate_skipped_total = 0
 
+    # Coarse progress log gate shared by nested admission/rescue/closure helpers.
+    solver_progress_log = _env_bool("SOLVER_PROGRESS_LOG", True)
+
+    # Persistent hard follower-anchor constraints accepted by required closure.
+    # Each item is (pin_key, target_scalar).  These constraints are passed to
+    # every subsequent QP solve so an accepted policy-blocked edge remains exact.
+    required_anchor_active = []
+
+    # Width-pressure admission heuristic is available but default-off; in the
+    # latest dataset it performed worse than HPWL-first. Enable explicitly with
+    # ADMISSION_WIDTH_PRIORITY=1.
+    admission_width_priority = str(os.environ.get("ADMISSION_WIDTH_PRIORITY", "0")).strip().lower() not in {"0", "false", "no"}
+    component_fallback_policy = os.environ.get("COMPONENT_FALLBACK_POLICY", "nearest_fixed_axis").strip().lower()
+    follower_anchor_closure = str(os.environ.get("FOLLOWER_ANCHOR_CLOSURE", "1")).strip().lower() not in {"0", "false", "no"}
+
+    # Adaptive two-stage mode.  The ordinary outer loop must stay close to the
+    # old fast path.  Expensive score/replacement/rescue/target-scan logic is
+    # entered only after the report-style final collector proves that real
+    # same-axis blockers remain.
+    adaptive_strict_closure = str(os.environ.get("ADAPTIVE_STRICT_CLOSURE", "1")).strip().lower() not in {"0", "false", "no"}
+    final_rescue_count_gate = str(os.environ.get("FINAL_RESCUE_COUNT_GATE", "1")).strip().lower() not in {"0", "false", "no"}
+
+    # Final residual rescue pass. This is deliberately generic: after the main
+    # greedy admission and follower-anchor closure have produced a feasible
+    # placement, re-collect the still-misaligned same-axis/pair-feasible targets
+    # and try to admit them again under the current geometry. It does not use
+    # any module-specific names.
+    final_rescue_enable = str(os.environ.get("FINAL_RESCUE_ENABLE", "1")).strip().lower() not in {"0", "false", "no"}
+    final_rescue_rounds = int(os.environ.get("FINAL_RESCUE_ROUNDS", "2"))
+    final_rescue_search_cap = int(os.environ.get("FINAL_RESCUE_SEARCH_CAP", "10"))
+    final_rescue_swap_cap = int(os.environ.get("FINAL_RESCUE_SWAP_CAP", "3"))
+    final_rescue_removal_pool_cap = int(os.environ.get("FINAL_RESCUE_REMOVAL_POOL_CAP", "32"))
+    final_rescue_beam_width = int(os.environ.get("FINAL_RESCUE_BEAM_WIDTH", "128"))
+    final_rescue_global_swap = str(os.environ.get("FINAL_RESCUE_GLOBAL_SWAP", "1")).strip().lower() not in {"0", "false", "no"}
+    # Score-guarded rescue: accept final rescue mutations only if the residual
+    # blocker score improves. This prevents arbitrary local swaps that are
+    # feasible but make the final residual distribution worse.
+    final_rescue_score_accept = str(os.environ.get("FINAL_RESCUE_SCORE_ACCEPT", "1")).strip().lower() not in {"0", "false", "no"}
+    final_rescue_score_mode = os.environ.get("FINAL_RESCUE_SCORE_MODE", "count_total_max").strip().lower()
+    # Diagnostic-only minimum-removal search for the final blockers. This does
+    # not change the solution; it explains whether a blocker is directly
+    # feasible, or how many nearby active hard-pairs must be removed before it
+    # becomes feasible.
+    final_blocker_diagnose = str(os.environ.get("FINAL_BLOCKER_DIAGNOSE", "1")).strip().lower() not in {"0", "false", "no"}
+    final_blocker_diag_limit = int(os.environ.get("FINAL_BLOCKER_DIAG_LIMIT", "50"))
+    final_blocker_diag_max_remove = int(os.environ.get("FINAL_BLOCKER_DIAG_MAX_REMOVE", "3"))
+    final_blocker_diag_pool_cap = int(os.environ.get("FINAL_BLOCKER_DIAG_POOL_CAP", "24"))
+    final_blocker_diag_beam_width = int(os.environ.get("FINAL_BLOCKER_DIAG_BEAM_WIDTH", "128"))
+
+    # Admission-level score/replacement: use the same true-blocker objective as
+    # final rescue while admitting families, so early locally-feasible choices do
+    # not block higher-value residual edges.
+    admission_score_accept = str(os.environ.get("ADMISSION_SCORE_ACCEPT", "0")).strip().lower() not in {"0", "false", "no"}
+    admission_replacement_enable = str(os.environ.get("ADMISSION_REPLACEMENT_ENABLE", "0")).strip().lower() not in {"0", "false", "no"}
+    admission_replacement_max_remove = int(os.environ.get("ADMISSION_REPLACEMENT_MAX_REMOVE", "3"))
+    admission_replacement_pool_cap = int(os.environ.get("ADMISSION_REPLACEMENT_POOL_CAP", "24"))
+    admission_replacement_beam_width = int(os.environ.get("ADMISSION_REPLACEMENT_BEAM_WIDTH", "64"))
+
+    # Required hard closure is different from score rescue: after the ordinary
+    # solver converges, every actionable same-axis residual edge is treated as a
+    # required equality. Allowed pairs are committed if feasible, possibly after
+    # bounded local removal; reference-master-blocked pairs are converted to hard
+    # follower-anchor scalar constraints. Delta is not optimized here: success
+    # means exact equality within tol, failure is reported as a hard blocker.
+    required_hard_closure_enable = str(os.environ.get("REQUIRED_HARD_CLOSURE_ENABLE", "1")).strip().lower() not in {"0", "false", "no"}
+    required_hard_closure_rounds = int(os.environ.get("REQUIRED_HARD_CLOSURE_ROUNDS", "5"))
+    required_hard_closure_max_remove = int(os.environ.get("REQUIRED_HARD_CLOSURE_MAX_REMOVE", "3"))
+    required_hard_closure_pool_cap = int(os.environ.get("REQUIRED_HARD_CLOSURE_POOL_CAP", "32"))
+    required_hard_closure_beam_width = int(os.environ.get("REQUIRED_HARD_CLOSURE_BEAM_WIDTH", "128"))
+
+    # Policy-component fallback: only try policy fallback representatives whose
+    # current pair HPWL is within this limit. Larger-HPWL policy edges are
+    # dropped by policy and are not sent to GUROBI.
+    policy_component_fallback_hpwl_limit = float(os.environ.get("POLICY_COMPONENT_FALLBACK_HPWL_LIMIT", "500"))
+
+    # Final conflict replacement for the small remaining policy representatives.
+    # After policy-component fallback has selected the HPWL-ordered representative,
+    # this pass may remove nearby active hard-pairs and/or old persistent anchors
+    # touching the representative endpoints, then retry the hard anchor.
+    policy_min_edge_conflict_replace_enable = _env_bool("POLICY_MIN_EDGE_CONFLICT_REPLACE_ENABLE", True)
+    policy_min_edge_conflict_replace_rounds = int(os.environ.get("POLICY_MIN_EDGE_CONFLICT_REPLACE_ROUNDS", "3"))
+    policy_min_edge_conflict_replace_max_remove = int(os.environ.get("POLICY_MIN_EDGE_CONFLICT_REPLACE_MAX_REMOVE", "3"))
+    policy_min_edge_conflict_replace_pool_cap = int(os.environ.get("POLICY_MIN_EDGE_CONFLICT_REPLACE_POOL_CAP", "32"))
+    policy_min_edge_conflict_replace_beam_width = int(os.environ.get("POLICY_MIN_EDGE_CONFLICT_REPLACE_BEAM_WIDTH", "128"))
+    # Final policy representative rescue knobs.  These are deliberately scoped
+    # to the tiny residual policy-min-conflict pass so ordinary admission remains
+    # stable and fast.
+    policy_min_edge_target_scan_enable = _env_bool("POLICY_MIN_EDGE_TARGET_SCAN_ENABLE", True)
+    policy_min_edge_target_scan_points = int(os.environ.get("POLICY_MIN_EDGE_TARGET_SCAN_POINTS", "17"))
+    policy_min_edge_target_order_hint = _env_bool("POLICY_MIN_EDGE_TARGET_ORDER_HINT", True)
+    policy_min_edge_alias_removal_enable = _env_bool("POLICY_MIN_EDGE_ALIAS_REMOVAL_ENABLE", True)
+    policy_min_edge_conflict_verbose = _env_bool("POLICY_MIN_EDGE_CONFLICT_VERBOSE", False)
+    policy_min_edge_conflict_detail_limit = int(os.environ.get("POLICY_MIN_EDGE_CONFLICT_DETAIL_LIMIT", "8"))
+
 
     def _is_master_inst_for_policy(inst_name):
         G = _find_group_of_inst(groups, inst_name)
         return G is None or inst_name == G.canon_inst
 
+    def _is_follower_inst_for_policy(inst_name):
+        G = _find_group_of_inst(groups, inst_name)
+        return G is not None and inst_name != G.canon_inst
+
     def _hard_pair_allowed_by_ref_master_policy(hp):
         if not enable_hard_iso or follower_hardpairs_affect_master:
             return True
         return _is_master_inst_for_policy(hp.pin_a[0]) and _is_master_inst_for_policy(hp.pin_b[0])
+
+    def _template_var_key_for_pin(pin_key):
+        """Return the optimization variable identity controlled by a real pin.
+
+        In hard-iso mode many real pins in reused instances share the same
+        template variable.  Exact real-pin matching is therefore too weak for
+        conflict removal: an old anchor or hard-pair on a sibling instance may
+        constrain the same underlying variable.
+        """
+        if enable_hard_iso and pin_key in inst_pin_state:
+            inst, pname = pin_key
+            G = _find_group_of_inst(groups, inst)
+            if G is not None and pname in G.template_pins:
+                return ("template", G.name, pname)
+        return ("real", pin_key)
+
+    def _pin_template_scalar_from_real_target(pin_key, target_s):
+        """Map a real fixed scalar target to the pin's template scalar."""
+        if not enable_hard_iso or pin_key not in inst_pin_state:
+            return float(target_s)
+        inst, pname = pin_key
+        G = _find_group_of_inst(groups, inst)
+        if G is None or pname not in G.template_pins:
+            return float(target_s)
+        st = inst_pin_state[pin_key]
+        a, b = G.inst_affine[inst][st.seg_id]
+        if abs(float(a)) < 1e-12:
+            return float(target_s)
+        return (float(target_s) - float(b)) / float(a)
+
+    def _apply_order_hints(order_hint_constraints):
+        """Move only the ordering state to target positions before a trial solve.
+
+        The QP solve still enforces the real hard constraints.  This hint only
+        lets order/no-overlap constraints be rebuilt around the candidate target
+        instead of around the previous, still-misaligned coordinates.  Without
+        this, a feasible target can be rejected solely because it would require a
+        local legal reordering on the affected segment.
+        """
+        if not order_hint_constraints:
+            return
+        for pin_key, target_s in _dedup_fixed_constraints(order_hint_constraints) or []:
+            if pin_key not in inst_pin_state:
+                continue
+            if enable_hard_iso:
+                inst, pname = pin_key
+                G = _find_group_of_inst(groups, inst)
+                if G is not None and pname in G.template_pins:
+                    G.template_pins[pname].canon_s = float(_pin_template_scalar_from_real_target(pin_key, target_s))
+                    continue
+            inst_pin_state[pin_key].s_center = float(target_s)
 
     def _hp_sig(hp):
         a, b = hp.as_undirected_key()
@@ -1507,6 +1687,272 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
             return float("inf")
         st1, st2 = inst_pin_state[hp.pin_a], inst_pin_state[hp.pin_b]
         return abs(float(st1.s_center) - float(st2.s_center))
+
+    def _edge_aligned_after_solve(hp, check_tol=None):
+        """Return True only when the target edge is actually aligned now.
+
+        A trial anchor/hard-pair is not considered accepted merely because the
+        QP is feasible.  It must also make the target edge's free-axis scalar
+        delta vanish within tolerance; otherwise the caller must roll the trial
+        back.  This prevents misleading logs such as kept=1 while residual_after
+        is unchanged.
+        """
+        t = tol if check_tol is None else float(check_tol)
+        return _alignment_delta(hp) <= t + 1e-7
+
+    def _post_delta(hp):
+        return float(_alignment_delta(hp))
+
+    def _fixed_axis_distance(hp):
+        """Distance on the non-free axis of a same-free-axis hard-align pair.
+
+        For x-free horizontal pins this is vertical distance; for y-free vertical
+        pins this is horizontal distance. Component fallback uses this to keep
+        the physically nearest edge when a star-like component has no common
+        scalar interval.
+        """
+        if hp.pin_a not in inst_pin_state or hp.pin_b not in inst_pin_state:
+            return float("inf")
+        st1, st2 = inst_pin_state[hp.pin_a], inst_pin_state[hp.pin_b]
+        seg1 = find_segment_by_global_id(real_segments, st1.seg_id)
+        seg2 = find_segment_by_global_id(real_segments, st2.seg_id)
+        return abs(float(seg1.fixed_coord) - float(seg2.fixed_coord))
+
+    def _follower_anchor_constraint_from_pair(hp):
+        """Return the legacy exactly-one-follower anchor item.
+
+        This helper is kept for compatibility with earlier closure code.  The
+        hard-closure path below uses _policy_target_constraint_sets_from_pair,
+        which also covers two-follower / follower-master policy-blocked edges.
+        """
+        if not enable_hard_iso or not follower_anchor_closure:
+            return None
+        if hp.pin_a not in inst_pin_state or hp.pin_b not in inst_pin_state:
+            return None
+        a_f = _is_follower_inst_for_policy(hp.pin_a[0])
+        b_f = _is_follower_inst_for_policy(hp.pin_b[0])
+        if a_f == b_f:
+            return None
+        anchor = hp.pin_a if a_f else hp.pin_b
+        movable = hp.pin_b if a_f else hp.pin_a
+        ast, mst = inst_pin_state[anchor], inst_pin_state[movable]
+        aseg = find_segment_by_global_id(real_segments, ast.seg_id)
+        mseg = find_segment_by_global_id(real_segments, mst.seg_id)
+        if aseg.free_axis != mseg.free_axis or aseg.free_axis != hp.axis:
+            return None
+        target = float(ast.s_center)
+        if target < float(mst.s_min) - 1e-9 or target > float(mst.s_max) + 1e-9:
+            return None
+        return (movable, target, hp)
+
+    def _dedup_fixed_constraints(items):
+        """Deduplicate fixed scalar constraints, rejecting same-pin conflicts."""
+        by_pin = {}
+        out = []
+        for pin_key, target in items or []:
+            target = float(target)
+            if pin_key in by_pin:
+                if abs(by_pin[pin_key] - target) > 1e-6:
+                    return None
+                continue
+            by_pin[pin_key] = target
+            out.append((pin_key, target))
+        return out
+
+    def _policy_target_constraint_sets_from_pair(hp, include_scan=False):
+        """Return candidate hard fixed-scalar sets for a policy-blocked edge.
+
+        Required hard-closure semantics are stricter than the earlier soft/greedy
+        anchor idea: if a same-axis edge is policy-blocked by reference-master,
+        we try to make delta exactly zero without creating a bidirectional
+        follower->template equality.  We do that by fixing both endpoints to a
+        common scalar target inside their pair interval.  For exactly-one-follower
+        pairs, the follower endpoint's current scalar is tried first, preserving
+        the original 'follower as anchor' interpretation.  For two-follower or
+        otherwise ambiguous policy pairs, we try current endpoint scalars and a
+        midpoint/average target inside the common interval.
+        """
+        if not (enable_hard_iso and follower_anchor_closure):
+            return []
+        if hp.pin_a not in inst_pin_state or hp.pin_b not in inst_pin_state:
+            return []
+        sta = inst_pin_state[hp.pin_a]
+        stb = inst_pin_state[hp.pin_b]
+        sega = find_segment_by_global_id(real_segments, sta.seg_id)
+        segb = find_segment_by_global_id(real_segments, stb.seg_id)
+        if sega.free_axis != segb.free_axis or sega.free_axis != hp.axis:
+            return []
+
+        lo = max(float(sta.s_min), float(stb.s_min))
+        hi = min(float(sta.s_max), float(stb.s_max))
+        if lo > hi + 1e-9:
+            return []
+
+        sa = float(sta.s_center)
+        sb = float(stb.s_center)
+        a_f = _is_follower_inst_for_policy(hp.pin_a[0])
+        b_f = _is_follower_inst_for_policy(hp.pin_b[0])
+
+        def inside(x):
+            return lo - 1e-9 <= float(x) <= hi + 1e-9
+
+        def clamp(x):
+            return max(lo, min(hi, float(x)))
+
+        targets = []
+        # Exactly-one-follower: preserve the original scheme by trying the
+        # follower scalar first.  If it is outside the other endpoint's interval,
+        # try bounded alternatives instead of silently skipping the edge.
+        if a_f != b_f:
+            anchor_s = sa if a_f else sb
+            if inside(anchor_s):
+                targets.append(float(anchor_s))
+
+        # Generic policy-blocked fallback.  These candidates make the pair exact
+        # if they are globally feasible under no-overlap/order constraints.
+        for x in (sa, sb, 0.5 * (sa + sb), 0.5 * (lo + hi), clamp(sa), clamp(sb)):
+            x = clamp(x)
+            if inside(x):
+                targets.append(float(x))
+
+        # Final representative rescue may need to search the full scalar
+        # interval.  Previous versions tried only current/midpoint targets; the
+        # remaining TA9L/TA9L3 blocker showed that all those legacy points can be
+        # infeasible even when another local-order-compatible target exists.
+        if include_scan and policy_min_edge_target_scan_enable:
+            nscan = max(3, int(policy_min_edge_target_scan_points))
+            if hi >= lo:
+                for i in range(nscan):
+                    t = lo if nscan == 1 else lo + (hi - lo) * i / float(nscan - 1)
+                    if inside(t):
+                        targets.append(float(t))
+            # Add biased points near the current endpoints and their midpoint.
+            span = max(hi - lo, 0.0)
+            for base in (sa, sb, 0.5 * (sa + sb)):
+                for frac in (0.001, 0.005, 0.01, 0.025, 0.05):
+                    off = span * frac
+                    for x in (base - off, base + off):
+                        x = clamp(x)
+                        if inside(x):
+                            targets.append(float(x))
+
+        # Deterministic de-duplication.
+        uniq_targets = []
+        seen = set()
+        for x in targets:
+            rx = round(float(x), 6)
+            if rx in seen:
+                continue
+            seen.add(rx)
+            uniq_targets.append(float(x))
+
+        freeze_both = _env_bool("POLICY_TARGET_FREEZE_BOTH", True)
+        sets = []
+        for target in uniq_targets:
+            if freeze_both:
+                cons = [(hp.pin_a, target), (hp.pin_b, target)]
+            else:
+                # Legacy mode: only fix the non-follower/movable endpoint when
+                # the policy pair has exactly one follower; otherwise fall back
+                # to freezing both because there is no unambiguous movable side.
+                if a_f != b_f:
+                    movable = hp.pin_b if a_f else hp.pin_a
+                    cons = [(movable, target)]
+                else:
+                    cons = [(hp.pin_a, target), (hp.pin_b, target)]
+            cons = _dedup_fixed_constraints(cons)
+            if cons:
+                sets.append(cons)
+        return sets
+
+    def _follower_anchor_fixed_constraints_from_pair(hp):
+        """Return the first policy-target constraint set for compatibility."""
+        sets = _policy_target_constraint_sets_from_pair(hp)
+        return sets[0] if sets else None
+
+    def _pin_width(pin_key):
+        st = inst_pin_state.get(pin_key)
+        return float(getattr(st, "width", 0.0)) if st is not None else 0.0
+
+    def _edge_width(hp):
+        return max(_pin_width(hp.pin_a), _pin_width(hp.pin_b))
+
+    def _edge_interval_slack(hp):
+        iva = _interval_of(hp.pin_a)
+        ivb = _interval_of(hp.pin_b)
+        if iva is None or ivb is None:
+            return float("inf")
+        lo = max(float(iva[0]), float(ivb[0]))
+        hi = min(float(iva[1]), float(ivb[1]))
+        return max(0.0, hi - lo)
+
+    def _edge_width_pressure(hp):
+        # Larger means more critical. Slack is floored to avoid exploding on
+        # near-zero intervals while still ranking them first.
+        width = _edge_width(hp)
+        slack = max(_edge_interval_slack(hp), 1e-6)
+        return width / slack
+
+    def _admission_priority(hp):
+        """Sort key for candidate admission. Lower is better.
+
+        With ADMISSION_WIDTH_PRIORITY=1:
+          1) larger pin width first;
+          2) smaller common interval slack first;
+          3) smaller current HPWL first;
+          4) deterministic pin name tie-break.
+
+        With ADMISSION_WIDTH_PRIORITY=0, preserve the old HPWL-first behavior.
+        """
+        hpwl = _compute_hpwl(hp)
+        if not admission_width_priority:
+            return (hpwl, str(hp.as_undirected_key()))
+        return (
+            -_edge_width(hp),
+            _edge_interval_slack(hp),
+            hpwl,
+            str(hp.as_undirected_key()),
+        )
+
+    def _subset_admission_priority(edges):
+        edges = list(edges)
+        if not admission_width_priority:
+            return (
+                sum(_compute_hpwl(e) for e in edges),
+                ";".join(str(e.as_undirected_key()) for e in sorted(edges, key=lambda x: str(x.as_undirected_key()))),
+            )
+        return (
+            -sum(_edge_width(e) for e in edges),
+            sum(_edge_interval_slack(e) for e in edges),
+            sum(_compute_hpwl(e) for e in edges),
+            ";".join(str(e.as_undirected_key()) for e in sorted(edges, key=lambda x: str(x.as_undirected_key()))),
+        )
+
+    def _component_fallback_priority(hp):
+        """Sort key for choosing one edge when a hard-align component has no
+        common interval.
+
+        Default policy is nearest_fixed_axis: for a star-like component such as
+        GH connected to GH1/GH2/GH3/GH4, keep the GH edge whose non-free-axis
+        distance is shortest. This preserves the physically nearest alignment
+        instead of forcing all leaves to a single impossible scalar coordinate.
+        """
+        hpwl = _compute_hpwl(hp)
+        policy = component_fallback_policy
+        if policy in {"nearest", "nearest_fixed", "nearest_fixed_axis", "fixed_axis"}:
+            return (_fixed_axis_distance(hp), hpwl, str(hp.as_undirected_key()))
+        if policy in {"hpwl", "shortest", "shortest_hpwl"}:
+            return (hpwl, str(hp.as_undirected_key()))
+        if policy in {"width", "wide"}:
+            return (-_edge_width(hp), hpwl, str(hp.as_undirected_key()))
+        # Optional legacy width-pressure policy.
+        return (
+            -_edge_width_pressure(hp),
+            -_edge_width(hp),
+            _edge_interval_slack(hp),
+            hpwl,
+            str(hp.as_undirected_key()),
+        )
 
     def _components_from_pairs(pairs_list):
         parent = {}
@@ -1599,7 +2045,8 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
                 solve_inner_qp_dummy(groups, inst_pin_state, orders_try, hard_pairs_active,
                                      enable_hard_iso=enable_hard_iso, keepout=keepout,
                                      real_segments=real_segments, prev_values=prev_values_try,
-                                     init_values=initial_real_anchor)
+                                     init_values=initial_real_anchor,
+                                     fixed_scalar_constraints=required_anchor_active)
                 _refresh_bucket_from_state()
                 if last_orders is not None and orders_equal(last_orders, orders_try):
                     orders = orders_try
@@ -1630,10 +2077,29 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
 
         if enable_hard_iso and not follower_hardpairs_affect_master:
             before_policy = len(newly_triggered)
-            newly_triggered = [hp for hp in newly_triggered if _hard_pair_allowed_by_ref_master_policy(hp)]
+            allowed = []
+            follower_anchorable = 0
+            blocked = 0
+            for hp in newly_triggered:
+                if _hard_pair_allowed_by_ref_master_policy(hp):
+                    allowed.append(hp)
+                else:
+                    # Do not admit it as an ordinary equality because that would
+                    # pull the master/template. It may still be handled after the
+                    # main solve by follower-anchor closure if exactly one endpoint
+                    # is a follower and the other endpoint can move to the follower
+                    # scalar coordinate.
+                    if _follower_anchor_constraint_from_pair(hp) is not None:
+                        follower_anchorable += 1
+                    else:
+                        blocked += 1
+            newly_triggered = allowed
             dropped_policy = before_policy - len(newly_triggered)
             if dropped_policy:
-                _debug_print(f"[iso-master] dropped follower-side hard_pairs that would pull master: {dropped_policy}")
+                _debug_print(
+                    f"[iso-master] held follower-side hard_pairs out of ordinary admission: "
+                    f"{dropped_policy} anchorable_now={follower_anchorable} blocked_now={blocked}"
+                )
 
         feasible_triggered = []
         skipped = 0
@@ -1687,10 +2153,13 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
                     kept.extend(edges)
                 else:
                     dropped_components += 1
-                    best = min(edges, key=_compute_hpwl)
+                    best = min(edges, key=_component_fallback_priority)
                     kept.append(best)
             if dropped_components:
-                _debug_print(f"[outer] component-level infeasible hard-align components: {dropped_components}; kept only shortest-hpwl edge per such component")
+                _debug_print(
+                    f"[outer] component-level infeasible hard-align components: {dropped_components}; "
+                    f"kept one edge per component by policy={component_fallback_policy}"
+                )
             newly_triggered = kept
         return newly_triggered
 
@@ -1750,7 +2219,7 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
 
         family_order = sorted(
             family_to_candidates.items(),
-            key=lambda kv: (min(_compute_hpwl(hp) for hp in kv[1]), len(kv[1]))
+            key=lambda kv: (min(_admission_priority(hp) for hp in kv[1]), len(kv[1]))
         )
 
         total_candidates = len(candidates)
@@ -1758,7 +2227,7 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
             family_active = [hp for hp in hard_pairs_active if _family_key(hp) == fam_key]
             union_edges = []
             seen_union = set()
-            for hp in sorted(family_active + fam_candidates, key=_compute_hpwl):
+            for hp in sorted(family_active + fam_candidates, key=_admission_priority):
                 if hp not in seen_union:
                     seen_union.add(hp)
                     union_edges.append(hp)
@@ -1772,13 +2241,15 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
                 for k in range(len(union_edges), len(base_active_set) - 1, -1):
                     combos = list(combinations(union_edges, k))
                     combos.sort(key=lambda combo: (
-                        sum(_compute_hpwl(hp) for hp in combo),
+                        # Prefer more admitted critical width-pressure edges when
+                        # several subsets have the same cardinality.
+                        _subset_admission_priority(combo),
                         -sum(1 for hp in combo if hp in base_active_set),
                     ))
                     found = False
                     for combo in combos:
                         combo_set = set(combo)
-                        ok, err = _attempt_replace(base_active_set, combo_set)
+                        ok, err = _attempt_replace_admission(base_active_set, combo_set)
                         if ok:
                             chosen_subset = combo_set
                             chosen_err = None
@@ -1790,7 +2261,7 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
                         break
             else:
                 current_family_set = set(family_active)
-                ordered_candidates = sorted(fam_candidates, key=_compute_hpwl)
+                ordered_candidates = sorted(fam_candidates, key=_admission_priority)
 
                 for hp in ordered_candidates:
                     if hp in current_family_set:
@@ -1815,44 +2286,90 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
                                 )
                             continue
 
-                    ok, err = _attempt_replace(current_family_set, current_family_set | {hp})
+                    ok, err = _attempt_replace_admission(current_family_set, current_family_set | {hp})
                     if ok:
                         current_family_set = {e for e in hard_pairs_active if _family_key(e) == fam_key}
                         continue
 
                     if allow_family_swap and current_family_set:
                         swapped = False
-                        removal_pool = sorted(
-                            current_family_set,
-                            key=lambda old_hp: (
-                                -_compute_hpwl(old_hp),
-                                -_alignment_delta(old_hp),
-                            )
-                        )[:max(1, removal_pool_cap)]
+                        if admission_width_priority:
+                            # Try removing low-criticality existing family edges first
+                            # to make room for a high-pressure new edge.
+                            removal_pool = sorted(
+                                current_family_set,
+                                key=lambda old_hp: (
+                                    _edge_width_pressure(old_hp),
+                                    _edge_width(old_hp),
+                                    -_compute_hpwl(old_hp),
+                                    str(old_hp.as_undirected_key()),
+                                )
+                            )[:max(1, removal_pool_cap)]
+                        else:
+                            removal_pool = sorted(
+                                current_family_set,
+                                key=lambda old_hp: (
+                                    -_compute_hpwl(old_hp),
+                                    -_alignment_delta(old_hp),
+                                )
+                            )[:max(1, removal_pool_cap)]
 
                         trial_removals = []
                         for r in range(1, max(1, swap_cap) + 1):
                             for rem in combinations(removal_pool, r):
                                 rem_set = set(rem)
-                                score = (
-                                    sum(_compute_hpwl(e) for e in rem_set),
-                                    sum(_alignment_delta(e) for e in rem_set),
-                                )
-                                trial_removals.append((score, rem_set))
-                        trial_removals.sort(key=lambda item: item[0], reverse=True)
+                                if admission_width_priority:
+                                    score = (
+                                        sum(_edge_width_pressure(e) for e in rem_set),
+                                        sum(_edge_width(e) for e in rem_set),
+                                        -sum(_compute_hpwl(e) for e in rem_set),
+                                    )
+                                    # lower score means less critical; try removing it first
+                                    trial_removals.append((score, rem_set))
+                                else:
+                                    score = (
+                                        sum(_compute_hpwl(e) for e in rem_set),
+                                        sum(_alignment_delta(e) for e in rem_set),
+                                    )
+                                    trial_removals.append((score, rem_set))
+                        trial_removals.sort(key=lambda item: item[0], reverse=(not admission_width_priority))
                         for _, rem_set in trial_removals[:max(1, beam_width)]:
                             trial_set = (current_family_set - rem_set) | {hp}
-                            ok2, err2 = _attempt_replace(current_family_set, trial_set)
+                            ok2, err2 = _attempt_replace_admission(current_family_set, trial_set)
                             if ok2:
                                 current_family_set = {e for e in hard_pairs_active if _family_key(e) == fam_key}
                                 swapped = True
                                 break
                             if chosen_err is None:
                                 chosen_err = err2
+                        if (not swapped) and admission_replacement_enable:
+                            pool = _candidate_local_removal_pool(hp, admission_replacement_pool_cap)
+                            for rem_set in _bounded_removal_combos(pool, admission_replacement_max_remove, admission_replacement_beam_width):
+                                ok3, err3 = _attempt_replace_admission(rem_set, {hp})
+                                if ok3:
+                                    current_family_set = {e for e in hard_pairs_active if _family_key(e) == fam_key}
+                                    swapped = True
+                                    break
+                                if chosen_err is None:
+                                    chosen_err = err3
                         if not swapped and chosen_err is None:
                             chosen_err = err
-                    elif chosen_err is None:
-                        chosen_err = err
+                    else:
+                        if admission_replacement_enable:
+                            pool = _candidate_local_removal_pool(hp, admission_replacement_pool_cap)
+                            replaced = False
+                            for rem_set in _bounded_removal_combos(pool, admission_replacement_max_remove, admission_replacement_beam_width):
+                                ok3, err3 = _attempt_replace_admission(rem_set, {hp})
+                                if ok3:
+                                    current_family_set = {e for e in hard_pairs_active if _family_key(e) == fam_key}
+                                    replaced = True
+                                    break
+                                if chosen_err is None:
+                                    chosen_err = err3
+                            if not replaced and chosen_err is None:
+                                chosen_err = err
+                        elif chosen_err is None:
+                            chosen_err = err
 
                 chosen_subset = {e for e in hard_pairs_active if _family_key(e) == fam_key}
 
@@ -1883,6 +2400,1368 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
             _debug_print(f"[outer] family admission: admitted={admitted} rejected={rejected} from candidates={total_candidates}")
         return admitted, rejected
 
+    def _collect_true_same_axis_blockers_report_style(include_active=True):
+        """Collect the same actionable blockers used by the final report.
+
+        This is the canonical residual collector used by admission scoring,
+        final rescue, and blocker diagnosis. It intentionally matches the run
+        script's report semantics:
+          * HPWL must be below threshold;
+          * endpoints must have the same free_axis;
+          * pair legal intervals must intersect;
+          * component-empty groups keep one edge by the configured fallback
+            policy and drop the rest from the ordinary blocker count.
+        """
+        _refresh_bucket_from_state()
+        records = []
+        seen = set()
+        for net in active_nets:
+            for p in getattr(net, 'pins', []) or []:
+                key1 = (p.parent_inst, p.pingroup_name)
+                if key1 not in inst_pin_state:
+                    continue
+                for succ_full in getattr(p, 'successors', []) or []:
+                    key2 = _parse_successor_full_name(succ_full)
+                    if key2 is None or key2 not in inst_pin_state:
+                        continue
+                    edge_key = (key1, key2) if key1 <= key2 else (key2, key1)
+                    if edge_key in seen:
+                        continue
+                    seen.add(edge_key)
+                    st1, st2 = inst_pin_state[key1], inst_pin_state[key2]
+                    seg1 = find_segment_by_global_id(real_segments, st1.seg_id)
+                    seg2 = find_segment_by_global_id(real_segments, st2.seg_id)
+                    if seg1.free_axis not in {'x', 'y'} or seg1.free_axis != seg2.free_axis:
+                        continue
+                    axis = seg1.free_axis
+                    hpwl = (abs(float(st1.s_center) - float(st2.s_center)) +
+                            abs(float(seg1.fixed_coord) - float(seg2.fixed_coord)))
+                    if hpwl >= (hpwl_thresh + pair_hpwl_gate_margin):
+                        continue
+                    lo = max(float(st1.s_min), float(st2.s_min))
+                    hi = min(float(st1.s_max), float(st2.s_max))
+                    if lo > hi + 1e-9:
+                        continue
+                    hp = HardAlignPair(key1, key2, axis)
+                    delta = _alignment_delta(hp)
+                    fixed_axis_dist = _fixed_axis_distance(hp)
+                    records.append({
+                        'hp': hp,
+                        'edge_key': hp.as_undirected_key(),
+                        'delta': float(delta),
+                        'hpwl': float(hpwl),
+                        'fixed_axis_distance': float(fixed_axis_dist),
+                        'slack': float(hi - lo),
+                        'lo': float(lo),
+                        'hi': float(hi),
+                    })
+
+        # Component-empty fallback matching solver policy. Components are built
+        # over all same-axis pair-feasible low-HPWL records, then non-kept edges
+        # from empty components are excluded from actionable residual blockers.
+        parent = {}
+        node_iv = {}
+        def find(x):
+            parent.setdefault(x, x)
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+        for rec in records:
+            hp = rec['hp']
+            union(hp.pin_a, hp.pin_b)
+            node_iv[hp.pin_a] = _interval_of(hp.pin_a)
+            node_iv[hp.pin_b] = _interval_of(hp.pin_b)
+        comps = {}
+        for n in list(parent.keys()):
+            comps.setdefault(find(n), []).append(n)
+        dropped_component_edges = set()
+        for nodes in comps.values():
+            if len(nodes) <= 2:
+                continue
+            ivs = [node_iv[n] for n in nodes if n in node_iv and node_iv[n] is not None]
+            if not ivs:
+                continue
+            lo = max(float(iv[0]) for iv in ivs)
+            hi = min(float(iv[1]) for iv in ivs)
+            if lo <= hi + 1e-9:
+                continue
+            nset = set(nodes)
+            comp_recs = [rec for rec in records if rec['hp'].pin_a in nset and rec['hp'].pin_b in nset]
+            if not comp_recs:
+                continue
+            kept = min(comp_recs, key=lambda rec: _component_fallback_priority(rec['hp']))
+            kept_key = kept['edge_key']
+            for rec in comp_recs:
+                if rec['edge_key'] != kept_key:
+                    dropped_component_edges.add(rec['edge_key'])
+
+        blockers = []
+        for rec in records:
+            hp = rec['hp']
+            if rec['delta'] <= tol:
+                continue
+            if rec['edge_key'] in dropped_component_edges:
+                continue
+            if rec['edge_key'] in policy_component_dropped_edge_keys:
+                continue
+            if (not include_active) and hp in hard_pairs_active:
+                continue
+            blockers.append(rec)
+        blockers.sort(key=lambda rec: (
+            -rec['delta'],
+            rec['fixed_axis_distance'],
+            -_edge_width(rec['hp']),
+            rec['slack'],
+            rec['hpwl'],
+            str(rec['edge_key']),
+        ))
+        return blockers
+
+    def _collect_final_rescue_candidates():
+        """Collect ordinary residual hard-align candidates under report semantics."""
+        blockers = _collect_true_same_axis_blockers_report_style(include_active=False)
+        out = []
+        seen = set()
+        for rec in blockers:
+            hp = rec['hp']
+            if hp.as_undirected_key() in seen:
+                continue
+            seen.add(hp.as_undirected_key())
+            if hp in hard_pairs_active:
+                continue
+            if not _hpwl_gate_allows_pair(hp):
+                continue
+            # Ordinary admission must respect reference-master policy; follower-
+            # side pairs are left for follower-anchor closure and diagnosis.
+            if not _hard_pair_allowed_by_ref_master_policy(hp):
+                continue
+            out.append(hp)
+        return out
+
+    def _residual_score():
+        """Canonical residual score over the same blockers used by final report."""
+        residual = _collect_true_same_axis_blockers_report_style(include_active=True)
+        if not residual:
+            return (0, 0.0, 0.0, 0.0)
+        deltas = [float(rec['delta']) for rec in residual]
+        hpwls = [float(rec['hpwl']) for rec in residual]
+        count = len(residual)
+        total_delta = float(sum(deltas))
+        max_delta = float(max(deltas))
+        hpwl_sum = float(sum(hpwls))
+        if final_rescue_score_mode in {"delta", "delta_first", "residual"}:
+            return (total_delta, max_delta, count, hpwl_sum)
+        if final_rescue_score_mode in {"max", "max_first"}:
+            return (max_delta, total_delta, count, hpwl_sum)
+        return (count, total_delta, max_delta, hpwl_sum)
+
+    def _candidate_local_removal_pool(hp, limit):
+        """Return active hard pairs most likely to conflict with hp.
+
+        This optional global-swap pool is local and generic: it considers active
+        pairs sharing a segment with either endpoint of hp, then falls back to
+        same family. It is disabled by default because trading one aligned edge
+        for another is not always a net improvement, but it is useful for
+        diagnosing tight local conflicts.
+        """
+        if hp.pin_a not in inst_pin_state or hp.pin_b not in inst_pin_state:
+            return []
+        segs = {inst_pin_state[hp.pin_a].seg_id, inst_pin_state[hp.pin_b].seg_id}
+        target_vars = {_template_var_key_for_pin(hp.pin_a), _template_var_key_for_pin(hp.pin_b)}
+        pool = []
+        for old in hard_pairs_active:
+            try:
+                old_segs = set()
+                if old.pin_a in inst_pin_state:
+                    old_segs.add(inst_pin_state[old.pin_a].seg_id)
+                if old.pin_b in inst_pin_state:
+                    old_segs.add(inst_pin_state[old.pin_b].seg_id)
+                old_vars = {_template_var_key_for_pin(old.pin_a), _template_var_key_for_pin(old.pin_b)}
+                if (old_segs & segs or _family_key(old) == _family_key(hp) or
+                        (policy_min_edge_alias_removal_enable and old_vars & target_vars)):
+                    pool.append(old)
+            except Exception:
+                continue
+        pool = sorted(pool, key=lambda e: (
+            _edge_width_pressure(e),
+            _edge_width(e),
+            -_compute_hpwl(e),
+            str(e.as_undirected_key()),
+        ))
+        return pool[:max(0, int(limit))]
+
+    def _snapshot_all_state():
+        return {
+            "active": set(hard_pairs_active),
+            "inst": snapshot_inst_state(inst_pin_state),
+            "tmpl": snapshot_template(groups),
+            "bucket": {seg: list(lst) for seg, lst in bucket_by_seg.items()},
+            "orders": {seg: list(lst) for seg, lst in orders.items()},
+            "anchors": list(required_anchor_active),
+            "policy_dropped_keys": set(policy_component_dropped_edge_keys),
+            "policy_dropped_records": list(policy_component_dropped_records),
+        }
+
+    def _restore_all_state(snap):
+        nonlocal hard_pairs_active, bucket_by_seg, orders, required_anchor_active
+        nonlocal policy_component_dropped_edge_keys, policy_component_dropped_records
+        hard_pairs_active = set(snap["active"])
+        restore_inst_state(inst_pin_state, snap["inst"])
+        restore_template(groups, snap["tmpl"])
+        bucket_by_seg = {seg: list(lst) for seg, lst in snap["bucket"].items()}
+        orders = {seg: list(lst) for seg, lst in snap["orders"].items()}
+        required_anchor_active = list(snap.get("anchors", []))
+        policy_component_dropped_edge_keys = set(snap.get("policy_dropped_keys", set()))
+        policy_component_dropped_records = list(snap.get("policy_dropped_records", []))
+
+    def _attempt_replace_admission(replace_edges, subset_edges):
+        """Admission-layer replacement with optional canonical-score guard."""
+        if not admission_score_accept:
+            return _attempt_replace(set(replace_edges), set(subset_edges))
+        snap = _snapshot_all_state()
+        score_before = _residual_score()
+        ok, err = _attempt_replace(set(replace_edges), set(subset_edges))
+        if not ok:
+            return False, err
+        score_after = _residual_score()
+        if _score_improved(score_before, score_after):
+            return True, None
+        _restore_all_state(snap)
+        return False, RuntimeError(f"admission score did not improve: before={score_before} after={score_after}")
+
+    def _score_improved(old_score, new_score):
+        eps = 1e-7
+        for old, new in zip(old_score, new_score):
+            if new < old - eps:
+                return True
+            if new > old + eps:
+                return False
+        return False
+
+    def _attempt_replace_dry(replace_edges, subset_edges):
+        """Feasibility probe that always restores the current accepted state."""
+        snap = _snapshot_all_state()
+        ok, err = _attempt_replace(set(replace_edges), set(subset_edges))
+        _restore_all_state(snap)
+        return ok, err
+
+    def _attempt_replace_score_accept(replace_edges, subset_edges, old_score=None):
+        """Attempt a replacement and accept only if residual score improves.
+
+        This wrapper is used only by the final residual rescue path.  Main greedy
+        admission remains cardinality-oriented for speed/stability.
+        """
+        snap = _snapshot_all_state()
+        score_before = _residual_score() if old_score is None else old_score
+        ok, err = _attempt_replace(set(replace_edges), set(subset_edges))
+        if not ok:
+            return False, err, score_before, score_before
+        score_after = _residual_score()
+        if final_rescue_score_accept and not _score_improved(score_before, score_after):
+            _restore_all_state(snap)
+            return False, RuntimeError(f"rescue score did not improve: before={score_before} after={score_after}"), score_before, score_after
+        return True, None, score_before, score_after
+
+    def _rank_removal_combo(rem_set):
+        rem_set = set(rem_set)
+        return (
+            len(rem_set),
+            sum(_edge_width_pressure(e) for e in rem_set),
+            sum(_edge_width(e) for e in rem_set),
+            -sum(_compute_hpwl(e) for e in rem_set),
+            ";".join(str(e.as_undirected_key()) for e in sorted(rem_set, key=lambda x: str(x.as_undirected_key()))),
+        )
+
+    def _bounded_removal_combos(pool, max_remove, beam_width):
+        combos = []
+        max_r = max(0, min(int(max_remove), len(pool)))
+        for r in range(1, max_r + 1):
+            for rem in combinations(pool, r):
+                combos.append((_rank_removal_combo(rem), set(rem)))
+        combos.sort(key=lambda x: x[0])
+        return [rem for _, rem in combos[:max(0, int(beam_width))]]
+
+    def _diagnose_final_blockers():
+        """Print bounded minimum-removal diagnostics for residual blockers.
+
+        This is intentionally diagnostic-only.  It does not commit any new
+        hard-pairs or removals.  It answers: direct feasible? if not, can this
+        blocker be made feasible by removing 1..N nearby active hard-pairs?
+        """
+        if not final_blocker_diagnose:
+            return
+        residual_recs = _collect_true_same_axis_blockers_report_style(include_active=True)
+        residual = [rec['hp'] for rec in residual_recs]
+        if not residual:
+            if solver_progress_log:
+                print("[final-diagnose] residual_blockers=0")
+            return
+        limit = max(0, int(final_blocker_diag_limit))
+        shown = min(len(residual), limit)
+        if solver_progress_log:
+            print(
+                f"[final-diagnose] residual_blockers={len(residual)} showing={shown} "
+                f"max_remove={final_blocker_diag_max_remove} pool_cap={final_blocker_diag_pool_cap}"
+            )
+        for idx, hp in enumerate(residual[:shown], 1):
+            if not _hard_pair_allowed_by_ref_master_policy(hp):
+                if solver_progress_log:
+                    print(
+                        f"[final-diagnose] #{idx:02d} reason=held_by_reference_master_policy "
+                        f"axis={hp.axis} delta={_alignment_delta(hp):.6f} hpwl={_compute_hpwl(hp):.6f} "
+                        f"fixed_axis_dist={_fixed_axis_distance(hp):.6f} slack={_edge_interval_slack(hp):.6f} "
+                        f"a={hp.pin_a} b={hp.pin_b}"
+                    )
+                continue
+            direct_ok, direct_err = _attempt_replace_dry(set(), {hp})
+            pool = _candidate_local_removal_pool(hp, final_blocker_diag_pool_cap)
+            min_remove = None
+            best_removal = None
+            best_err = direct_err
+            if not direct_ok and pool and final_blocker_diag_max_remove > 0:
+                for rem_set in _bounded_removal_combos(pool, final_blocker_diag_max_remove, final_blocker_diag_beam_width):
+                    ok, err = _attempt_replace_dry(rem_set, {hp})
+                    if ok:
+                        min_remove = len(rem_set)
+                        best_removal = rem_set
+                        best_err = None
+                        break
+                    best_err = err
+            reason = "direct_feasible" if direct_ok else ("feasible_after_removal" if min_remove is not None else "blocked_under_bounded_removal")
+            rem_desc = ""
+            if best_removal:
+                rem_desc = " remove=[" + "; ".join(str(_hp_sig(e)) for e in sorted(best_removal, key=lambda x: str(x.as_undirected_key()))) + "]"
+            err_desc = ""
+            if best_err is not None and reason == "blocked_under_bounded_removal":
+                msg = str(best_err).replace("\n", " ")
+                if len(msg) > 180:
+                    msg = msg[:177] + "..."
+                err_desc = f" err={msg}"
+            if solver_progress_log:
+                print(
+                    f"[final-diagnose] #{idx:02d} reason={reason} "
+                    f"min_remove={0 if direct_ok else (min_remove if min_remove is not None else '>{}'.format(final_blocker_diag_max_remove))} "
+                    f"axis={hp.axis} delta={_alignment_delta(hp):.6f} hpwl={_compute_hpwl(hp):.6f} "
+                    f"fixed_axis_dist={_fixed_axis_distance(hp):.6f} slack={_edge_interval_slack(hp):.6f} "
+                    f"a={hp.pin_a} b={hp.pin_b}{rem_desc}{err_desc}"
+                )
+
+    def _run_final_rescue_pass():
+        """Generic score-guarded residual rescue for true same-axis blockers.
+
+        The main outer loop is a forward greedy family admission.  Some pairs are
+        not candidates at the right moment, or become feasible only after later
+        movement/follower-anchor closure.  This pass recomputes residual targets
+        from the final geometry and attempts to admit them with a wider search.
+
+        Unlike ordinary admission, every committed mutation must improve the
+        final residual score unless FINAL_RESCUE_SCORE_ACCEPT=0.
+        """
+        nonlocal hard_pairs_active, inst_pin_state, bucket_by_seg, orders
+        if not final_rescue_enable:
+            _diagnose_final_blockers()
+            return 0, 0
+
+        total_admitted = 0
+        last_score = None
+        for rr in range(max(0, final_rescue_rounds)):
+            candidates = _collect_final_rescue_candidates()
+            if not candidates:
+                break
+            score_before = _residual_score()
+            if score_before == last_score and rr > 0:
+                break
+            last_score = score_before
+
+            round_snap = _snapshot_all_state()
+            admitted = 0
+            rejected = 0
+            anchor_kept = 0
+            global_added = 0
+            score_after_ordinary = score_before
+
+            # First try the existing family admission machinery, but keep it only
+            # if the final residual score improves.  This prevents feasible but
+            # globally harmful swaps from becoming permanent.
+            admitted_tmp, rejected_tmp = _run_family_admission(
+                candidates,
+                search_cap=final_rescue_search_cap,
+                allow_family_swap=True,
+                swap_cap=final_rescue_swap_cap,
+                removal_pool_cap=final_rescue_removal_pool_cap,
+                beam_width=final_rescue_beam_width,
+            )
+            anchor_tmp, _, _ = _run_follower_anchor_closure()
+            score_after_ordinary = _residual_score()
+            if (admitted_tmp or anchor_tmp) and (not final_rescue_score_accept or _score_improved(score_before, score_after_ordinary)):
+                admitted = admitted_tmp
+                anchor_kept = anchor_tmp
+                total_admitted += admitted + int(anchor_kept)
+            else:
+                _restore_all_state(round_snap)
+
+            # Optional local global-swap: try one residual at a time by removing
+            # nearby low-criticality active pairs.  Each successful swap must also
+            # improve the residual score.
+            if final_rescue_global_swap:
+                candidates2 = _collect_final_rescue_candidates()
+                for hp in candidates2[:max(1, final_rescue_beam_width)]:
+                    if _alignment_delta(hp) <= tol or hp in hard_pairs_active:
+                        continue
+                    old_score = _residual_score()
+                    ok, _, _, _ = _attempt_replace_score_accept(set(), {hp}, old_score=old_score)
+                    if ok:
+                        global_added += 1
+                        total_admitted += 1
+                        continue
+
+                    pool = _candidate_local_removal_pool(hp, final_rescue_removal_pool_cap)
+                    found = False
+                    for rem_set in _bounded_removal_combos(pool, final_rescue_swap_cap, final_rescue_beam_width):
+                        old_score = _residual_score()
+                        ok2, _, _, _ = _attempt_replace_score_accept(rem_set, {hp}, old_score=old_score)
+                        if ok2:
+                            global_added += 1
+                            total_admitted += 1
+                            found = True
+                            break
+                    if found:
+                        continue
+
+            # Follower-anchor targets can change after successful ordinary/global
+            # rescue. Keep anchor closure only if it improves residual score.
+            anchor_snap = _snapshot_all_state()
+            score_before_anchor = _residual_score()
+            anchor_extra, _, _ = _run_follower_anchor_closure()
+            score_after_anchor = _residual_score()
+            if anchor_extra and (not final_rescue_score_accept or _score_improved(score_before_anchor, score_after_anchor)):
+                anchor_kept += anchor_extra
+                total_admitted += int(anchor_extra)
+            elif anchor_extra:
+                _restore_all_state(anchor_snap)
+
+            score_after = _residual_score()
+            if solver_progress_log:
+                print(
+                    f"[final-rescue] round={rr + 1} score_before={score_before} score_after={score_after} "
+                    f"ordinary_admitted={admitted} anchor_kept={anchor_kept} global_added={global_added}"
+                )
+            if final_rescue_count_gate and score_after[0] >= score_before[0]:
+                # Do not spend more rounds when the primary residual count does
+                # not decrease.  Tiny total-delta improvements caused the heavy
+                # rescue loop to run for a long time on old/easy datasets.
+                break
+            if not _score_improved(score_before, score_after):
+                break
+
+        final_residual = len(_collect_true_same_axis_blockers_report_style(include_active=True))
+        if final_rescue_enable and solver_progress_log:
+            print(f"[final-rescue] total_progress={total_admitted} residual_after={final_residual} score={_residual_score()}")
+        if not required_hard_closure_enable:
+            _diagnose_final_blockers()
+        return total_admitted, final_residual
+
+    def _run_follower_anchor_closure():
+        """Try follower-side low-HPWL edges without letting them pull master.
+
+        The closure is greedy and feasibility-preserving. For each exactly-one-
+        follower pair, the follower endpoint supplies a fixed scalar target and
+        only the other endpoint receives a hard fixed-scalar constraint. Failed
+        constraints are rejected and do not affect the final state.
+        """
+        nonlocal inst_pin_state, bucket_by_seg, orders
+        if not (enable_hard_iso and follower_anchor_closure and not follower_hardpairs_affect_master):
+            return 0, 0, 0
+
+        _refresh_bucket_from_state()
+        raw_pairs = build_hard_align_pairs(active_nets, inst_pin_state, real_segments, hpwl_thresh)
+        candidates = []
+        skipped = 0
+        for hp in raw_pairs:
+            if _hard_pair_allowed_by_ref_master_policy(hp):
+                continue
+            item = _follower_anchor_constraint_from_pair(hp)
+            if item is None:
+                skipped += 1
+                continue
+            candidates.append(hp)
+
+        if not candidates:
+            return 0, 0, skipped
+
+        candidates = sorted(
+            set(candidates),
+            key=lambda hp: (_fixed_axis_distance(hp), _compute_hpwl(hp), str(hp.as_undirected_key()))
+        )
+
+        fixed_constraints = []
+        fixed_sig = set()
+        kept = 0
+        rejected = 0
+
+        for hp in candidates:
+            item = _follower_anchor_constraint_from_pair(hp)
+            if item is None:
+                skipped += 1
+                continue
+            constraints_for_hp = _follower_anchor_fixed_constraints_from_pair(hp)
+            if not constraints_for_hp:
+                skipped += 1
+                continue
+            sig_items = tuple((pk, round(float(ts), 6)) for pk, ts in constraints_for_hp)
+            if any(si in fixed_sig for si in sig_items):
+                continue
+
+            inst_backup = snapshot_inst_state(inst_pin_state)
+            tmpl_backup = snapshot_template(groups)
+            bucket_backup = {seg: list(lst) for seg, lst in bucket_by_seg.items()}
+            orders_backup = {seg: list(lst) for seg, lst in orders.items()}
+            trial_constraints = required_anchor_active + fixed_constraints + constraints_for_hp
+
+            try:
+                _refresh_bucket_from_state()
+                last_orders = None
+                for _ in range(max(1, local_fixedpoint_iters)):
+                    orders_try = _rebuild_orders_current()
+                    prev_values_try = snapshot_template(groups) if enable_hard_iso else snapshot_inst_state(inst_pin_state)
+                    solve_inner_qp_dummy(
+                        groups, inst_pin_state, orders_try, hard_pairs_active,
+                        enable_hard_iso=enable_hard_iso, keepout=keepout,
+                        real_segments=real_segments, prev_values=prev_values_try,
+                        init_values=initial_real_anchor,
+                        fixed_scalar_constraints=trial_constraints,
+                    )
+                    _refresh_bucket_from_state()
+                    if last_orders is not None and orders_equal(last_orders, orders_try):
+                        orders = orders_try
+                        break
+                    last_orders = orders_try
+                else:
+                    orders = _rebuild_orders_current()
+
+                fixed_constraints.extend(constraints_for_hp)
+                fixed_sig.update(sig_items)
+                kept += 1
+            except Exception:
+                rejected += 1
+                restore_inst_state(inst_pin_state, inst_backup)
+                restore_template(groups, tmpl_backup)
+                bucket_by_seg = bucket_backup
+                orders = orders_backup
+
+        if kept or rejected or skipped:
+            _debug_print(f"[follower-anchor] kept={kept} rejected={rejected} skipped={skipped} candidates={len(candidates)}")
+        return kept, rejected, skipped
+
+
+
+    def _attempt_required_anchor_constraints(anchor_constraints, order_hint_constraints=None):
+        """Commit a set of follower-anchor fixed-scalar constraints exactly.
+
+        This is used only in the terminal required-closure phase.  The list of
+        fixed constraints is cumulative, so every accepted anchor remains enforced
+        while later anchors are tested.  After this phase no ordinary solve is run,
+        so the final state keeps these hard equalities.
+
+        order_hint_constraints is trial-only: before building orders, the hinted
+        pins/templates are moved to their target scalar positions.  The QP still
+        validates the actual fixed constraints.  This fixes false infeasibility
+        caused by stale no-overlap order around a still-misaligned residual edge.
+        """
+        nonlocal inst_pin_state, bucket_by_seg, orders
+        inst_backup = snapshot_inst_state(inst_pin_state)
+        tmpl_backup = snapshot_template(groups)
+        bucket_backup = {seg: list(lst) for seg, lst in bucket_by_seg.items()}
+        orders_backup = {seg: list(lst) for seg, lst in orders.items()}
+        try:
+            if order_hint_constraints and policy_min_edge_target_order_hint:
+                _apply_order_hints(order_hint_constraints)
+            _refresh_bucket_from_state()
+            last_orders = None
+            for _ in range(max(1, local_fixedpoint_iters)):
+                orders_try = _rebuild_orders_current()
+                prev_values_try = snapshot_template(groups) if enable_hard_iso else snapshot_inst_state(inst_pin_state)
+                solve_inner_qp_dummy(
+                    groups, inst_pin_state, orders_try, hard_pairs_active,
+                    enable_hard_iso=enable_hard_iso, keepout=keepout,
+                    real_segments=real_segments, prev_values=prev_values_try,
+                    init_values=initial_real_anchor,
+                    fixed_scalar_constraints=anchor_constraints,
+                )
+                _refresh_bucket_from_state()
+                if last_orders is not None and orders_equal(last_orders, orders_try):
+                    orders = orders_try
+                    return True, None
+                last_orders = orders_try
+            orders = _rebuild_orders_current()
+            return True, None
+        except Exception as e:
+            restore_inst_state(inst_pin_state, inst_backup)
+            restore_template(groups, tmpl_backup)
+            bucket_by_seg = bucket_backup
+            orders = orders_backup
+            return False, e
+
+    def _run_required_anchor_closure(policy_records):
+        """Force reference-master-blocked residuals via policy-component targets.
+
+        The requested policy is:
+          1. Use plan B for policy-blocked edges: do not let the edge pull the
+             master/template as an ordinary equality; instead, create hard
+             fixed-scalar anchor constraints that make the relevant endpoints
+             equal.
+          2. If a connected policy component cannot be fully anchored, keep only
+             the edge with the smallest current HPWL in that component and mark
+             the other component edges as intentionally dropped. This mirrors the
+             GH star rule, but for reference-master policy components.
+
+        Accepted constraints are appended to required_anchor_active and are
+        passed to every later QP solve.  Dropped policy-component edge keys are
+        removed from the ordinary residual-blocker count.
+        """
+        nonlocal required_anchor_active, policy_component_dropped_edge_keys, policy_component_dropped_records
+        if not (enable_hard_iso and follower_anchor_closure and policy_records):
+            return 0, 0, len(policy_records)
+
+        accepted_constraints = []
+        fixed_by_pin = {}
+        for pin_key, target in required_anchor_active:
+            fixed_by_pin[pin_key] = float(target)
+
+        def _norm_edge_key(hp):
+            return hp.as_undirected_key()
+
+        def _dedup_edge_records(records):
+            out = []
+            seen_keys = set()
+            for rec in records:
+                k = rec.get('edge_key', _norm_edge_key(rec['hp']))
+                if k in seen_keys:
+                    continue
+                seen_keys.add(k)
+                out.append(rec)
+            return out
+
+        policy_records = _dedup_edge_records(policy_records)
+
+        # Connected components are built per axis; edges in different axes must
+        # never be forced into one scalar target.
+        parent = {}
+        def find(x):
+            parent.setdefault(x, x)
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        for rec in policy_records:
+            hp = rec['hp']
+            union((hp.axis, hp.pin_a), (hp.axis, hp.pin_b))
+
+        comps = {}
+        for rec in policy_records:
+            hp = rec['hp']
+            root = find((hp.axis, hp.pin_a))
+            comps.setdefault(root, []).append(rec)
+
+        def _constraints_conflict_or_new(cons):
+            """Return (conflict, new_constraints)."""
+            new_constraints = []
+            for pin_key, target in _dedup_fixed_constraints(cons):
+                target = float(target)
+                if pin_key in fixed_by_pin:
+                    if abs(fixed_by_pin[pin_key] - target) > 1e-6:
+                        return True, []
+                    continue
+                new_constraints.append((pin_key, target))
+            return False, new_constraints
+
+        def _try_accept_constraints(cons):
+            conflict, new_constraints = _constraints_conflict_or_new(cons)
+            if conflict or not new_constraints:
+                return False
+            trial_constraints = required_anchor_active + accepted_constraints + new_constraints
+            ok, _ = _attempt_required_anchor_constraints(trial_constraints)
+            if not ok:
+                return False
+            accepted_constraints.extend(new_constraints)
+            for pin_key, target in new_constraints:
+                fixed_by_pin[pin_key] = float(target)
+            return True
+
+        def _rebuild_fixed_by_pin():
+            fixed_by_pin.clear()
+            for pin_key, target in required_anchor_active:
+                fixed_by_pin[pin_key] = float(target)
+            for pin_key, target in accepted_constraints:
+                fixed_by_pin[pin_key] = float(target)
+
+        def _remove_anchor_constraints_for_pins(pin_set):
+            """Remove persistent/current-pass anchors touching pin_set.
+
+            This is used only for policy-component fallback: if a component
+            cannot be fully anchored, the requested rule is to keep the HPWL
+            shortest edge.  To make that possible, old policy anchors touching
+            the same pins may be replaced by the new shortest-edge anchor.
+            """
+            nonlocal required_anchor_active, accepted_constraints
+            pin_set = set(pin_set)
+            before_active = list(required_anchor_active)
+            before_accepted = list(accepted_constraints)
+            required_anchor_active = [c for c in required_anchor_active if c[0] not in pin_set]
+            accepted_constraints = [c for c in accepted_constraints if c[0] not in pin_set]
+            removed = (len(before_active) - len(required_anchor_active)) + (len(before_accepted) - len(accepted_constraints))
+            _rebuild_fixed_by_pin()
+            return removed, before_active, before_accepted
+
+        def _restore_anchor_constraint_lists(before_active, before_accepted):
+            nonlocal required_anchor_active, accepted_constraints
+            required_anchor_active = list(before_active)
+            accepted_constraints = list(before_accepted)
+            _rebuild_fixed_by_pin()
+
+        def _try_accept_constraints_replacing_pins(cons, replace_pins):
+            """Try cons after replacing old anchors on replace_pins.
+
+            If the replacement attempt fails, both anchor lists and the QP state
+            are restored by _attempt_required_anchor_constraints / explicit list
+            rollback.  If it succeeds, the new constraints stay persistent and
+            any old anchors on replace_pins remain removed.
+            """
+            removed, before_active, before_accepted = _remove_anchor_constraints_for_pins(replace_pins)
+            if removed <= 0:
+                return _try_accept_constraints(cons)
+            ok = _try_accept_constraints(cons)
+            if not ok:
+                _restore_anchor_constraint_lists(before_active, before_accepted)
+                return False
+            return True
+
+        def _pins_for_records(records):
+            pins = []
+            seen = set()
+            for rec in records:
+                hp = rec['hp']
+                for pin in (hp.pin_a, hp.pin_b):
+                    if pin not in seen:
+                        seen.add(pin)
+                        pins.append(pin)
+            return pins
+
+        def _component_interval(pins):
+            ivs = []
+            for pin in pins:
+                iv = _interval_of(pin)
+                if iv is None:
+                    return None
+                ivs.append(iv)
+            lo = max(float(iv[0]) for iv in ivs)
+            hi = min(float(iv[1]) for iv in ivs)
+            if lo > hi + 1e-9:
+                return None
+            return lo, hi
+
+        def _component_targets(records):
+            pins = _pins_for_records(records)
+            iv = _component_interval(pins)
+            if iv is None:
+                return []
+            lo, hi = iv
+            existing = []
+            for pin in pins:
+                if pin in fixed_by_pin:
+                    existing.append(float(fixed_by_pin[pin]))
+            # If component already contains fixed endpoints, all existing fixed
+            # targets must agree; otherwise the full component cannot be anchored.
+            if existing:
+                ref = existing[0]
+                if any(abs(x - ref) > 1e-6 for x in existing):
+                    return []
+                if lo - 1e-9 <= ref <= hi + 1e-9:
+                    return [ref]
+                return []
+
+            vals = []
+            for pin in pins:
+                st = inst_pin_state.get(pin)
+                if st is not None:
+                    vals.append(float(st.s_center))
+            if not vals:
+                vals = [0.5 * (lo + hi)]
+            vals_sorted = sorted(vals)
+            median = vals_sorted[len(vals_sorted) // 2]
+            mean = sum(vals) / len(vals)
+            def clamp(x):
+                return max(lo, min(hi, float(x)))
+            targets = []
+            for x in vals + [median, mean, 0.5 * (lo + hi), lo, hi]:
+                x = clamp(x)
+                if lo - 1e-9 <= x <= hi + 1e-9:
+                    targets.append(float(x))
+            # Prefer targets with smaller total movement of the component pins.
+            uniq = []
+            seen = set()
+            for x in targets:
+                rx = round(float(x), 6)
+                if rx in seen:
+                    continue
+                seen.add(rx)
+                movement = sum(abs(float(inst_pin_state[p].s_center) - float(x)) for p in pins if p in inst_pin_state)
+                uniq.append((movement, float(x)))
+            uniq.sort(key=lambda item: (item[0], item[1]))
+            return [x for _, x in uniq]
+
+        def _rollback_anchor_acceptance(before_active, before_accepted):
+            _restore_anchor_constraint_lists(before_active, before_accepted)
+
+        def _try_accept_full_component(records):
+            pins = _pins_for_records(records)
+            if not pins:
+                return False
+            hps = [rec['hp'] for rec in records]
+            for target in _component_targets(records):
+                cons = [(pin, target) for pin in pins]
+                before_active = list(required_anchor_active)
+                before_accepted = list(accepted_constraints)
+                if _try_accept_constraints(cons):
+                    if all(_edge_aligned_after_solve(hp) for hp in hps):
+                        return True
+                    # Feasible but not actually aligned: do not count as kept.
+                    _rollback_anchor_acceptance(before_active, before_accepted)
+            return False
+
+        def _try_accept_single_edge(rec, allow_replace=False, replace_pins=None):
+            hp = rec['hp']
+            candidate_sets = _policy_target_constraint_sets_from_pair(hp)
+            if replace_pins is None:
+                replace_pins = [hp.pin_a, hp.pin_b]
+            for cons in candidate_sets:
+                before_active = list(required_anchor_active)
+                before_accepted = list(accepted_constraints)
+                if allow_replace:
+                    accepted = _try_accept_constraints_replacing_pins(cons, replace_pins)
+                else:
+                    accepted = _try_accept_constraints(cons)
+                if accepted:
+                    if _edge_aligned_after_solve(hp):
+                        return True
+                    # Feasible QP, but the represented edge still has nonzero
+                    # delta. Roll back so this does not become a false kept.
+                    _rollback_anchor_acceptance(before_active, before_accepted)
+            return False
+
+        kept = 0
+        rejected = 0
+        skipped = 0
+        fallback_kept = 0
+        fallback_dropped = 0
+        full_component_kept = 0
+
+        ordered_components = sorted(
+            comps.values(),
+            key=lambda recs: (
+                min(float(r.get('hpwl', _compute_hpwl(r['hp']))) for r in recs),
+                -len(recs),
+                str(min(str(r.get('edge_key', _norm_edge_key(r['hp']))) for r in recs)),
+            )
+        )
+
+        for recs in ordered_components:
+            recs = _dedup_edge_records(recs)
+            recs.sort(key=lambda rec: (
+                float(rec.get('hpwl', _compute_hpwl(rec['hp']))),
+                float(rec.get('fixed_axis_distance', _fixed_axis_distance(rec['hp']))),
+                -_edge_width(rec['hp']),
+                str(rec.get('edge_key', _norm_edge_key(rec['hp']))),
+            ))
+
+            # First try the mathematically strongest plan B: anchor the entire
+            # policy component to one common target so every edge in the component
+            # has delta = 0.
+            if _try_accept_full_component(recs):
+                full_component_kept += 1
+                kept += len(recs)
+                continue
+
+            # If the component cannot be fully anchored, try fallback edges in
+            # HPWL order, but never send HPWL-over-limit edges to GUROBI.  The
+            # first feasible low-HPWL edge is kept; all other component edges are
+            # intentionally dropped from ordinary blocker accounting.  If no
+            # low-HPWL edge can be anchored, keep only the lowest-HPWL low-limit
+            # representative as unresolved and drop the rest.
+            eligible = [
+                rec for rec in recs
+                if float(rec.get('hpwl', _compute_hpwl(rec['hp']))) <= policy_component_fallback_hpwl_limit + 1e-9
+            ]
+            over_limit = [rec for rec in recs if rec not in eligible]
+            accepted_rec = None
+            accepted_replaced_existing_anchor = False
+            component_pins = _pins_for_records(recs)
+            for cand in eligible:
+                accepted = _try_accept_single_edge(cand)
+                replaced_existing_anchor = False
+                if not accepted:
+                    accepted = _try_accept_single_edge(cand, allow_replace=True, replace_pins=component_pins)
+                    replaced_existing_anchor = accepted
+                if accepted:
+                    accepted_rec = cand
+                    accepted_replaced_existing_anchor = replaced_existing_anchor
+                    break
+
+            if accepted_rec is not None:
+                fallback_kept += 1
+                kept += 1
+                kept_key = accepted_rec.get('edge_key', _norm_edge_key(accepted_rec['hp']))
+                for rec in recs:
+                    rec_key = rec.get('edge_key', _norm_edge_key(rec['hp']))
+                    if rec_key == kept_key:
+                        continue
+                    if rec_key not in policy_component_dropped_edge_keys:
+                        policy_component_dropped_edge_keys.add(rec_key)
+                        policy_component_dropped_records.append({
+                            'edge_key': rec_key,
+                            'hpwl': float(rec.get('hpwl', _compute_hpwl(rec['hp']))),
+                            'delta': float(rec.get('delta', _alignment_delta(rec['hp']))),
+                            'axis': rec['hp'].axis,
+                            'a': rec['hp'].pin_a,
+                            'b': rec['hp'].pin_b,
+                            'kept_edge': kept_key,
+                            'reason': 'policy_component_hpwl_ordered_keep_replace_old_anchor' if accepted_replaced_existing_anchor else 'policy_component_hpwl_ordered_keep',
+                        })
+                        fallback_dropped += 1
+            else:
+                # No candidate could be anchored.  Preserve exactly one
+                # low-limit representative if available, otherwise drop the whole
+                # over-limit component.  This keeps final blocker counts aligned
+                # with the user's HPWL-ordered fallback policy.
+                keep_key = None
+                if eligible:
+                    keep_rec = eligible[0]
+                    keep_key = keep_rec.get('edge_key', _norm_edge_key(keep_rec['hp']))
+                    rejected += 1
+                else:
+                    skipped += len(recs)
+                for rec in recs:
+                    rec_key = rec.get('edge_key', _norm_edge_key(rec['hp']))
+                    if keep_key is not None and rec_key == keep_key:
+                        continue
+                    if rec_key not in policy_component_dropped_edge_keys:
+                        policy_component_dropped_edge_keys.add(rec_key)
+                        policy_component_dropped_records.append({
+                            'edge_key': rec_key,
+                            'hpwl': float(rec.get('hpwl', _compute_hpwl(rec['hp']))),
+                            'delta': float(rec.get('delta', _alignment_delta(rec['hp']))),
+                            'axis': rec['hp'].axis,
+                            'a': rec['hp'].pin_a,
+                            'b': rec['hp'].pin_b,
+                            'kept_edge': keep_key,
+                            'reason': 'policy_component_hpwl_ordered_all_failed_drop_non_representatives' if keep_key is not None else 'policy_component_all_candidates_over_hpwl_limit',
+                        })
+                        fallback_dropped += 1
+
+        if accepted_constraints:
+            required_anchor_active.extend(accepted_constraints)
+        if solver_progress_log and (kept or rejected or skipped or fallback_dropped):
+            print(
+                f"[required-anchor] kept={kept} rejected={rejected} skipped={skipped} "
+                f"persistent={len(required_anchor_active)} candidates={len(policy_records)} "
+                f"full_components={full_component_kept} fallback_kept={fallback_kept} "
+                f"fallback_dropped={fallback_dropped} "
+                f"fallback_hpwl_limit={policy_component_fallback_hpwl_limit:g}"
+            )
+        return kept, rejected, skipped
+
+    def _commit_required_ordinary_blocker(hp):
+        """Force one ordinary blocker as a hard equality if bounded-feasible.
+
+        The acceptance criterion is feasibility, not score improvement.  If the
+        edge can be made feasible by removing up to REQUIRED_HARD_CLOSURE_MAX_REMOVE
+        nearby active hard-pairs, commit that replacement and let the removed edges
+        reappear as residual blockers in later rounds if they are still required.
+        """
+        if hp in hard_pairs_active and _alignment_delta(hp) <= tol:
+            return True, "already_aligned"
+        ok, err = _attempt_replace(set(), {hp})
+        if ok:
+            return True, "direct"
+        pool = _candidate_local_removal_pool(hp, required_hard_closure_pool_cap)
+        for rem_set in _bounded_removal_combos(pool, required_hard_closure_max_remove, required_hard_closure_beam_width):
+            ok2, err2 = _attempt_replace(rem_set, {hp})
+            if ok2:
+                return True, f"remove_{len(rem_set)}"
+            err = err2
+        return False, err
+
+    def _remove_policy_anchors_touching_pins(pin_set):
+        """Remove persistent required-anchor constraints touching pin_set.
+
+        In hard-iso mode this also removes anchors on alias real pins that share
+        the same template optimization variable.
+        """
+        nonlocal required_anchor_active
+        pin_set = set(pin_set or [])
+        target_vars = {_template_var_key_for_pin(pin) for pin in pin_set}
+        before = list(required_anchor_active)
+        kept = []
+        for c in required_anchor_active:
+            cpin = c[0]
+            if cpin in pin_set:
+                continue
+            if policy_min_edge_alias_removal_enable and _template_var_key_for_pin(cpin) in target_vars:
+                continue
+            kept.append(c)
+        required_anchor_active = kept
+        return before, len(before) - len(required_anchor_active)
+
+    def _drop_policy_component_mates_for_kept(kept_rec, reason="policy_component_representative_aligned_drop_mates"):
+        """Drop residual policy edges in the same connected component as kept_rec.
+
+        Conflict replacement works on one representative edge at a time.  After
+        a representative is really aligned, all remaining policy-blocked residual
+        edges connected to it by shared same-axis pins are policy fallbacks, not
+        ordinary blockers.  This closes the loop between edge-level acceptance
+        and the final collector.
+        """
+        kept_hp = kept_rec['hp']
+        kept_key = kept_rec.get('edge_key', kept_hp.as_undirected_key())
+        residual = _collect_true_same_axis_blockers_report_style(include_active=True)
+        policy_residual = [
+            r for r in residual
+            if not _hard_pair_allowed_by_ref_master_policy(r['hp'])
+            and r['hp'].axis == kept_hp.axis
+        ]
+        if not policy_residual:
+            return 0
+
+        # Build a same-axis connectivity component over the kept edge plus the
+        # current residual policy edges.  This catches the M case where aligning
+        # one representative makes another edge sharing the same pin appear.
+        parent = {}
+        def find(x):
+            parent.setdefault(x, x)
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        all_recs = [kept_rec] + policy_residual
+        for r in all_recs:
+            hp = r['hp']
+            if hp.axis != kept_hp.axis:
+                continue
+            union((hp.axis, hp.pin_a), (hp.axis, hp.pin_b))
+
+        kept_root = find((kept_hp.axis, kept_hp.pin_a))
+        dropped = 0
+        for r in policy_residual:
+            hp = r['hp']
+            if hp.axis != kept_hp.axis:
+                continue
+            if find((hp.axis, hp.pin_a)) != kept_root:
+                continue
+            rec_key = r.get('edge_key', hp.as_undirected_key())
+            if rec_key == kept_key:
+                continue
+            if rec_key not in policy_component_dropped_edge_keys:
+                policy_component_dropped_edge_keys.add(rec_key)
+                policy_component_dropped_records.append({
+                    'edge_key': rec_key,
+                    'hpwl': float(r.get('hpwl', _compute_hpwl(hp))),
+                    'delta': float(r.get('delta', _alignment_delta(hp))),
+                    'axis': hp.axis,
+                    'a': hp.pin_a,
+                    'b': hp.pin_b,
+                    'kept_edge': kept_key,
+                    'reason': reason,
+                })
+                dropped += 1
+        return dropped
+
+    def _collector_still_contains_edge(rec):
+        hp = rec['hp']
+        key = rec.get('edge_key', hp.as_undirected_key())
+        residual = _collect_true_same_axis_blockers_report_style(include_active=True)
+        return any(r.get('edge_key', r['hp'].as_undirected_key()) == key for r in residual)
+
+    def _try_policy_edge_anchor_with_conflict_replacement(rec):
+        """Try to force one remaining policy representative to delta=0.
+
+        This is more aggressive than policy-component fallback: it can remove
+        nearby active hard-pairs and old persistent anchors touching the two
+        endpoint pins, then re-solve with the candidate policy-target hard
+        constraints.  It is used only for final low-HPWL representatives that
+        survived all earlier closure passes.
+        """
+        nonlocal hard_pairs_active, required_anchor_active
+        hp = rec['hp']
+        if float(rec.get('hpwl', _compute_hpwl(hp))) > policy_component_fallback_hpwl_limit + 1e-9:
+            return False, "hpwl_over_policy_limit", 0
+        candidate_sets = _policy_target_constraint_sets_from_pair(hp, include_scan=True)
+        if not candidate_sets:
+            return False, "no_policy_target", 0
+        pool = _candidate_local_removal_pool(hp, policy_min_edge_conflict_replace_pool_cap)
+        removal_sets = [set()]
+        if policy_min_edge_conflict_replace_max_remove > 0 and pool:
+            removal_sets.extend(_bounded_removal_combos(
+                pool,
+                policy_min_edge_conflict_replace_max_remove,
+                policy_min_edge_conflict_replace_beam_width,
+            ))
+        # More conservative target sets first. The target generator already
+        # orders follower/current/midpoint candidates deterministically.
+        trials = 0
+        solve_failed = 0
+        post_delta_failed = 0
+        collector_failed = 0
+        last_detail = ""
+        for cons in candidate_sets:
+            cons = _dedup_fixed_constraints(cons)
+            if not cons:
+                continue
+            cons_pins = {pin for pin, _ in cons}
+            cons_vars = [_template_var_key_for_pin(pin) for pin, _ in cons]
+            cons_desc = ",".join(f"{pin}->{float(target):.6f}" for pin, target in cons)
+            for rem_set in removal_sets:
+                trials += 1
+                snap = _snapshot_all_state()
+                try:
+                    hard_pairs_active = set(hard_pairs_active) - set(rem_set)
+                    _, removed_anchors = _remove_policy_anchors_touching_pins(cons_pins)
+                    trial_constraints = required_anchor_active + cons
+                    ok, err = _attempt_required_anchor_constraints(
+                        trial_constraints,
+                        order_hint_constraints=cons if policy_min_edge_target_order_hint else None,
+                    )
+                    last_detail = (
+                        f"cons=[{cons_desc}] rem={len(rem_set)} removed_anchors={removed_anchors} "
+                        f"vars={cons_vars}"
+                    )
+                    if ok and _edge_aligned_after_solve(hp):
+                        required_anchor_active = list(trial_constraints)
+                        dropped_mates = _drop_policy_component_mates_for_kept(
+                            rec,
+                            reason="policy_component_representative_aligned_after_conflict_replace",
+                        )
+                        # Collector-level postcheck: the accepted representative
+                        # must actually disappear from the same final blocker
+                        # collector used by reporting.  If not, roll back the
+                        # anchors and any policy drops from this trial.
+                        if not _collector_still_contains_edge(rec):
+                            return True, (
+                                f"remove_{len(rem_set)};removed_anchors={removed_anchors};"
+                                f"drop_mates={dropped_mates};vars={cons_vars}"
+                            ), len(rem_set)
+                        collector_failed += 1
+                        err = RuntimeError(
+                            f"collector_postcheck_failed: delta={_post_delta(hp):.6f} "
+                            f"tol={tol:.6f} drop_mates={dropped_mates}"
+                        )
+                    # Feasible is not enough: the requested representative must
+                    # actually become aligned and disappear from the final
+                    # residual collector.  Otherwise roll back the trial.
+                    elif ok:
+                        post_delta_failed += 1
+                        err = RuntimeError(f"post_delta_not_aligned: delta={_post_delta(hp):.6f} tol={tol:.6f}")
+                    else:
+                        solve_failed += 1
+                    if err is not None:
+                        msg = str(err).replace("\n", " ")
+                        if len(msg) > 180:
+                            msg = msg[:177] + "..."
+                        last_detail += f" err={msg}"
+                    _restore_all_state(snap)
+                except Exception as e:
+                    solve_failed += 1
+                    _restore_all_state(snap)
+                    msg = str(e).replace("\n", " ")
+                    if len(msg) > 180:
+                        msg = msg[:177] + "..."
+                    last_detail = f"cons=[{cons_desc}] rem={len(rem_set)} vars={cons_vars} err={msg}"
+        return False, (
+            "blocked_under_conflict_replacement;"
+            f"trials={trials};solve_failed={solve_failed};"
+            f"post_delta_failed={post_delta_failed};collector_failed={collector_failed};"
+            f"last={last_detail}"
+        ), 0
+
+    def _run_policy_min_edge_conflict_replacement():
+        """Final rescue for remaining low-HPWL policy representatives.
+
+        The policy-component pass may reduce each unresolved component to one
+        HPWL-ordered representative. If that representative is still misaligned,
+        try to make it exact by replacing local active constraints. This pass is
+        feasibility-preserving: failed trials restore the full accepted state.
+        """
+        if not policy_min_edge_conflict_replace_enable:
+            return 0, len(_collect_true_same_axis_blockers_report_style(include_active=True))
+        total_kept = 0
+        total_removed = 0
+        for rr in range(max(0, policy_min_edge_conflict_replace_rounds)):
+            residual = _collect_true_same_axis_blockers_report_style(include_active=True)
+            policy_residual = [
+                rec for rec in residual
+                if not _hard_pair_allowed_by_ref_master_policy(rec['hp'])
+                and float(rec.get('hpwl', _compute_hpwl(rec['hp']))) <= policy_component_fallback_hpwl_limit + 1e-9
+            ]
+            if not policy_residual:
+                break
+            policy_residual.sort(key=lambda rec: (
+                float(rec.get('hpwl', _compute_hpwl(rec['hp']))),
+                float(rec.get('fixed_axis_distance', _fixed_axis_distance(rec['hp']))),
+                -_edge_width(rec['hp']),
+                str(rec.get('edge_key', rec['hp'].as_undirected_key())),
+            ))
+            kept = 0
+            removed = 0
+            tried = 0
+            post_rejected = 0
+            collector_rejected = 0
+            fail_reasons = defaultdict(int)
+            details = []
+            for rec in policy_residual:
+                tried += 1
+                ok, why, nrem = _try_policy_edge_anchor_with_conflict_replacement(rec)
+                hp = rec['hp']
+                edge_key = rec.get('edge_key', hp.as_undirected_key())
+                if ok:
+                    kept += 1
+                    removed += int(nrem)
+                    total_kept += 1
+                    total_removed += int(nrem)
+                    details.append(("accepted", rec, why))
+                else:
+                    reason_key = str(why).split(';', 1)[0]
+                    fail_reasons[reason_key] += 1
+                    if "post_delta_not_aligned" in str(why):
+                        post_rejected += 1
+                    elif "collector_postcheck_failed" in str(why):
+                        collector_rejected += 1
+                    details.append(("rejected", rec, why))
+            residual_after = len(_collect_true_same_axis_blockers_report_style(include_active=True))
+            if solver_progress_log:
+                fail_desc = ""
+                if fail_reasons:
+                    fail_desc = " fail=" + ",".join(f"{k}={v}" for k, v in sorted(fail_reasons.items()))
+                print(
+                    f"[policy-min-conflict] round={rr + 1} candidates={len(policy_residual)} "
+                    f"tried={tried} kept_aligned={kept} post_delta_rejected={post_rejected} "
+                    f"collector_rejected={collector_rejected} "
+                    f"removed_hard_pairs={removed} residual_after={residual_after} "
+                    f"hpwl_limit={policy_component_fallback_hpwl_limit:g}{fail_desc}"
+                )
+                if policy_min_edge_conflict_verbose and details:
+                    for status, rec, why in details[:max(0, policy_min_edge_conflict_detail_limit)]:
+                        hp = rec['hp']
+                        iv_lo = rec.get('lo', float('nan'))
+                        iv_hi = rec.get('hi', float('nan'))
+                        print(
+                            f"[policy-min-conflict-detail] {status} edge={rec.get('edge_key', hp.as_undirected_key())} "
+                            f"axis={hp.axis} delta={_alignment_delta(hp):.6f} hpwl={_compute_hpwl(hp):.6f} "
+                            f"iv=[{float(iv_lo):.6f},{float(iv_hi):.6f}] "
+                            f"vars=({_template_var_key_for_pin(hp.pin_a)}, {_template_var_key_for_pin(hp.pin_b)}) "
+                            f"why={why}"
+                        )
+            if kept == 0:
+                break
+            if residual_after == 0:
+                break
+        return total_kept, len(_collect_true_same_axis_blockers_report_style(include_active=True))
+
+    def _run_required_hard_closure_pass():
+        """Terminal hard closure for actionable same-axis residuals.
+
+        Goal: reduce true same-axis misalignment to zero under the current policy.
+        Cross-axis, pair-empty, and component-empty dropped-by-policy edges are
+        already excluded by the canonical collector.  Remaining ordinary edges are
+        forced as equality constraints if feasible; reference-master-blocked edges
+        are forced through follower-anchor hard scalar constraints when possible.
+        """
+        if not required_hard_closure_enable:
+            _diagnose_final_blockers()
+            return
+        total_direct = 0
+        total_replaced = 0
+        total_anchor = 0
+        last_sig = None
+        for rr in range(max(0, required_hard_closure_rounds)):
+            residual_recs = _collect_true_same_axis_blockers_report_style(include_active=True)
+            if not residual_recs:
+                if solver_progress_log:
+                    print(f"[required-closure] round={rr + 1} residual=0")
+                break
+            sig = tuple((rec['edge_key'], round(float(rec['delta']), 6)) for rec in residual_recs)
+            if sig == last_sig and rr > 0:
+                break
+            last_sig = sig
+
+            ordinary = [rec for rec in residual_recs if _hard_pair_allowed_by_ref_master_policy(rec['hp'])]
+            policy = [rec for rec in residual_recs if not _hard_pair_allowed_by_ref_master_policy(rec['hp'])]
+
+            round_direct = 0
+            round_replaced = 0
+            round_failed = 0
+            # Force ordinary blockers first.  This may move follower anchors, so
+            # follower-anchor closure is deliberately delayed until after ordinary
+            # hard-pair closure has no more progress.
+            for rec in ordinary:
+                hp = rec['hp']
+                if hp in hard_pairs_active and _alignment_delta(hp) <= tol:
+                    continue
+                ok, why = _commit_required_ordinary_blocker(hp)
+                if ok:
+                    if str(why).startswith('remove_'):
+                        round_replaced += 1
+                    else:
+                        round_direct += 1
+                else:
+                    round_failed += 1
+            total_direct += round_direct
+            total_replaced += round_replaced
+            remaining_after_ordinary = _collect_true_same_axis_blockers_report_style(include_active=True)
+            remaining_policy = [rec for rec in remaining_after_ordinary if not _hard_pair_allowed_by_ref_master_policy(rec['hp'])]
+
+            # If ordinary hard-pairs did not change anything this round, force all
+            # remaining reference-master-blocked pairs through hard anchors.  This
+            # is terminal: after anchors are accepted, no more ordinary solve should
+            # run unless another closure round makes progress and then anchors are
+            # re-established from the updated geometry.
+            anchor_kept = anchor_rejected = anchor_skipped = 0
+            if round_direct == 0 and round_replaced == 0 and remaining_policy:
+                anchor_kept, anchor_rejected, anchor_skipped = _run_required_anchor_closure(remaining_policy)
+                total_anchor += anchor_kept
+
+            residual_now = len(_collect_true_same_axis_blockers_report_style(include_active=True))
+            if solver_progress_log:
+                print(
+                    f"[required-closure] round={rr + 1} residual_before={len(residual_recs)} "
+                    f"ordinary={len(ordinary)} policy={len(policy)} direct={round_direct} "
+                    f"replaced={round_replaced} failed={round_failed} "
+                    f"anchor_kept={anchor_kept} anchor_rejected={anchor_rejected} "
+                    f"anchor_skipped={anchor_skipped} residual_after={residual_now}"
+                )
+            if residual_now == 0:
+                break
+            if round_direct == 0 and round_replaced == 0 and anchor_kept == 0:
+                break
+        conflict_kept, conflict_residual = _run_policy_min_edge_conflict_replacement()
+        if solver_progress_log:
+            final_res = len(_collect_true_same_axis_blockers_report_style(include_active=True))
+            print(
+                f"[required-closure] total_direct={total_direct} total_replaced={total_replaced} "
+                f"total_anchor={total_anchor} conflict_kept={conflict_kept} residual_after={final_res}"
+            )
+        _diagnose_final_blockers()
+
     bucket_by_seg = {}
 
     for outer_it in range(max_outer_iter):
@@ -1909,7 +3788,8 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
         solve_inner_qp_dummy(groups, inst_pin_state, orders, hard_pairs_active,
                              enable_hard_iso=enable_hard_iso, keepout=keepout,
                              real_segments=real_segments, prev_values=prev_values,
-                             init_values=initial_real_anchor)
+                             init_values=initial_real_anchor,
+                             fixed_scalar_constraints=required_anchor_active)
 
         _refresh_bucket_from_state()
         newly_triggered = _build_triggered_pairs(apply_component_gate=True)
@@ -1957,10 +3837,55 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
     solve_inner_qp_dummy(groups, inst_pin_state, orders, hard_pairs_active,
                          enable_hard_iso=enable_hard_iso, keepout=keepout,
                          real_segments=real_segments, prev_values=prev_values,
-                             init_values=initial_real_anchor)
+                             init_values=initial_real_anchor,
+                             fixed_scalar_constraints=required_anchor_active)
 
     if enable_hard_iso:
         inst_pin_state, bucket_by_seg = expand_template_to_instances(groups, real_segments, keepout)
+
+    # Do not run follower-anchor closure before the adaptive gate.  It can be
+    # expensive because it performs many trial QP solves, and old/easy datasets
+    # may already have zero actionable residuals after the ordinary fast path.
+    # Policy-blocked residuals are handled inside the strict branch below.
+
+    # Adaptive strict closure gate.  This must run before any expensive final
+    # rescue / required-closure search.  If the report-style collector already
+    # sees no actionable same-axis blockers, return through the final report path
+    # without extra GUROBI trial loops.
+    residual_before_strict = len(_collect_true_same_axis_blockers_report_style(include_active=True))
+    if solver_progress_log:
+        print(f"[adaptive] residual_before_strict={residual_before_strict} adaptive={int(adaptive_strict_closure)}")
+
+    if (not adaptive_strict_closure) or residual_before_strict > 0:
+        # Terminal hard closure first: this is usually cheaper and more decisive
+        # than generic final rescue for policy-blocked residuals.
+        _run_required_hard_closure_pass()
+
+        residual_after_required = len(_collect_true_same_axis_blockers_report_style(include_active=True))
+        if residual_after_required > 0:
+            # Revisit residual same-axis blockers under the final geometry only
+            # when strict closure leaves real blockers.
+            before_rescue_score = _residual_score()
+            _run_final_rescue_pass()
+            after_rescue_score = _residual_score()
+            if final_rescue_count_gate and after_rescue_score[0] >= before_rescue_score[0]:
+                if solver_progress_log:
+                    print(f"[adaptive] final-rescue count gate: before={before_rescue_score} after={after_rescue_score}")
+
+            # One more required closure pass may convert rescue-improved geometry
+            # into exact hard equality / policy anchor constraints.
+            if len(_collect_true_same_axis_blockers_report_style(include_active=True)) > 0:
+                _run_required_hard_closure_pass()
+    else:
+        if solver_progress_log:
+            print("[adaptive] skip strict closure: residual=0")
+        _diagnose_final_blockers()
+
+    if enable_hard_iso:
+        inst_pin_state, bucket_by_seg = expand_template_to_instances(groups, real_segments, keepout)
+
+    LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS = set(policy_component_dropped_edge_keys)
+    LAST_POLICY_COMPONENT_DROPPED_RECORDS = list(policy_component_dropped_records)
 
     if strict_pair_hpwl_gate:
         _debug_print(f"[outer] pair-hpwl gate total_skipped={hpwl_gate_skipped_total} threshold={hpwl_thresh:g} margin={pair_hpwl_gate_margin:g} debug={int(hpwl_gate_debug)}")
