@@ -51,6 +51,9 @@ from itertools import combinations
 # be fully anchored may intentionally keep only the HPWL-shortest edge.
 LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS = set()
 LAST_POLICY_COMPONENT_DROPPED_RECORDS = []
+# Policy/free-target edges intentionally removed from required alignment accounting.
+LAST_POLICY_FREE_TARGET_DROPPED_EDGE_KEYS = set()
+LAST_POLICY_FREE_TARGET_DROPPED_RECORDS = []
 
 def _env_bool(name, default=False):
     v = os.environ.get(name)
@@ -1376,10 +1379,15 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
                                             hpwl_thresh=500.0, max_outer_iter=5, tol=1e-3,
                                             enable_hard_iso=True):
     global LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS, LAST_POLICY_COMPONENT_DROPPED_RECORDS
+    global LAST_POLICY_FREE_TARGET_DROPPED_EDGE_KEYS, LAST_POLICY_FREE_TARGET_DROPPED_RECORDS
     LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS = set()
     LAST_POLICY_COMPONENT_DROPPED_RECORDS = []
+    LAST_POLICY_FREE_TARGET_DROPPED_EDGE_KEYS = set()
+    LAST_POLICY_FREE_TARGET_DROPPED_RECORDS = []
     policy_component_dropped_edge_keys = set()
     policy_component_dropped_records = []
+    policy_free_target_dropped_edge_keys = set()
+    policy_free_target_dropped_records = []
     module_map = {m.name: m for m in all_modules if getattr(m, "vertex", None)}
     real_segments = {m.name: extract_real_segments(m) for m in module_map.values()}
 
@@ -1537,6 +1545,13 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
     policy_min_edge_conflict_verbose = _env_bool("POLICY_MIN_EDGE_CONFLICT_VERBOSE", False)
     policy_min_edge_conflict_detail_limit = int(os.environ.get("POLICY_MIN_EDGE_CONFLICT_DETAIL_LIMIT", "8"))
 
+    # Master-only homology direct target closure.  For E--B where B is an
+    # A/B/C/D homology target, B must not move; only E is allowed to move to
+    # B's current derived/master scalar.  This avoids sending these edges into
+    # the generic policy-component anchor search.
+    free_to_homology_target_closure_enable = _env_bool("FREE_TO_HOMOLOGY_TARGET_CLOSURE", True)
+    free_to_homology_target_trial_budget = int(os.environ.get("FREE_TO_HOMOLOGY_TARGET_TRIAL_BUDGET", "128"))
+    free_to_homology_target_failed_edge_keys = set()
 
     def _is_master_inst_for_policy(inst_name):
         G = _find_group_of_inst(groups, inst_name)
@@ -1546,10 +1561,89 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
         G = _find_group_of_inst(groups, inst_name)
         return G is not None and inst_name != G.canon_inst
 
+    def _multi_iso_group_of_inst(inst_name):
+        """Return the reused/homology group for inst_name, ignoring singleton groups."""
+        G = _find_group_of_inst(groups, inst_name)
+        if G is None or len(getattr(G, "instances", []) or []) <= 1:
+            return None
+        return G
+
+    def _pin_role_for_alignment(pin_key):
+        """Role for master-only homology alignment semantics.
+
+        For a reused group ABCD, only A/canon_inst is a movable master source;
+        B/C/D are derived targets and never produce independent constraints.
+        Singleton/non-reused modules are ordinary free sources.
+        """
+        inst = pin_key[0]
+        G = _multi_iso_group_of_inst(inst)
+        if G is None:
+            return ("free", None)
+        if inst == G.canon_inst:
+            return ("homology_master", G.name)
+        return ("homology_follower", G.name)
+
+    def _alignment_policy_class(hp):
+        """Classify a candidate edge under master-only/follower-derived semantics.
+
+        ordinary:
+            May enter as a normal equality.  This includes A--A inside the
+            master instance and non-homology/free pairs.
+        free_to_homology_target:
+            One endpoint is a movable source, the other is an A/B/C/D homology
+            target.  It must be handled as a terminal fixed-target constraint:
+            the target is held fixed, and the movable endpoint is moved to it.
+        covered_by_homology:
+            Same reused group but not A--A.  B/C/D internal, B--C, and A--B
+            observations are covered by A and are not independent requirements.
+        ignored_by_policy:
+            Both endpoints are derived/non-movable homology targets from
+            different groups, or otherwise ambiguous under the no-reverse-pull
+            rule.
+        """
+        ra, ga = _pin_role_for_alignment(hp.pin_a)
+        rb, gb = _pin_role_for_alignment(hp.pin_b)
+
+        # Same reused group: only master-instance A--A edges are real required
+        # constraints.  Follower copies and copy-to-copy observations are not
+        # independent; they are covered by the master A solution.
+        if ga is not None and ga == gb:
+            if ra == "homology_master" and rb == "homology_master":
+                return "ordinary", None, None
+            return "covered_by_homology", None, None
+
+        # No reused group involved.
+        if ga is None and gb is None:
+            return "ordinary", None, None
+
+        def is_source(role):
+            return role in {"free", "homology_master"}
+        def is_target(role):
+            return role in {"homology_master", "homology_follower"}
+
+        # Exactly one side is in a reused group: reused side is the target,
+        # outside/free side moves.  This covers E--B and E--A.
+        if ga is None and gb is not None:
+            return "free_to_homology_target", hp.pin_a, hp.pin_b
+        if gb is None and ga is not None:
+            return "free_to_homology_target", hp.pin_b, hp.pin_a
+
+        # Different reused groups.  Master--master edges are allowed as normal
+        # master-level constraints.  If exactly one side is a derived follower,
+        # move the source/master side to that follower target.  Follower--follower
+        # has no safe movable side and is ignored by policy.
+        if ra == "homology_master" and rb == "homology_master":
+            return "ordinary", None, None
+        if ra == "homology_follower" and is_source(rb):
+            return "free_to_homology_target", hp.pin_b, hp.pin_a
+        if rb == "homology_follower" and is_source(ra):
+            return "free_to_homology_target", hp.pin_a, hp.pin_b
+        return "ignored_by_policy", None, None
+
     def _hard_pair_allowed_by_ref_master_policy(hp):
         if not enable_hard_iso or follower_hardpairs_affect_master:
             return True
-        return _is_master_inst_for_policy(hp.pin_a[0]) and _is_master_inst_for_policy(hp.pin_b[0])
+        return _alignment_policy_class(hp)[0] == "ordinary"
 
     def _template_var_key_for_pin(pin_key):
         """Return the optimization variable identity controlled by a real pin.
@@ -1719,28 +1813,27 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
         return abs(float(seg1.fixed_coord) - float(seg2.fixed_coord))
 
     def _follower_anchor_constraint_from_pair(hp):
-        """Return the legacy exactly-one-follower anchor item.
+        """Return a role-aware target anchor for non-ordinary homology edges.
 
-        This helper is kept for compatibility with earlier closure code.  The
-        hard-closure path below uses _policy_target_constraint_sets_from_pair,
-        which also covers two-follower / follower-master policy-blocked edges.
+        Under master-only homology semantics, an edge such as E--B does not move
+        B.  B is a derived target, and E is moved to B.  The returned legacy tuple
+        is used only for counting/compatibility; the actual hard constraints are
+        generated by _policy_target_constraint_sets_from_pair().
         """
         if not enable_hard_iso or not follower_anchor_closure:
             return None
         if hp.pin_a not in inst_pin_state or hp.pin_b not in inst_pin_state:
             return None
-        a_f = _is_follower_inst_for_policy(hp.pin_a[0])
-        b_f = _is_follower_inst_for_policy(hp.pin_b[0])
-        if a_f == b_f:
+        cls, movable, target_pin = _alignment_policy_class(hp)
+        if cls != "free_to_homology_target" or movable is None or target_pin is None:
             return None
-        anchor = hp.pin_a if a_f else hp.pin_b
-        movable = hp.pin_b if a_f else hp.pin_a
-        ast, mst = inst_pin_state[anchor], inst_pin_state[movable]
-        aseg = find_segment_by_global_id(real_segments, ast.seg_id)
+        mst = inst_pin_state[movable]
+        tst = inst_pin_state[target_pin]
         mseg = find_segment_by_global_id(real_segments, mst.seg_id)
-        if aseg.free_axis != mseg.free_axis or aseg.free_axis != hp.axis:
+        tseg = find_segment_by_global_id(real_segments, tst.seg_id)
+        if mseg.free_axis != tseg.free_axis or mseg.free_axis != hp.axis:
             return None
-        target = float(ast.s_center)
+        target = float(tst.s_center)
         if target < float(mst.s_min) - 1e-9 or target > float(mst.s_max) + 1e-9:
             return None
         return (movable, target, hp)
@@ -1760,17 +1853,15 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
         return out
 
     def _policy_target_constraint_sets_from_pair(hp, include_scan=False):
-        """Return candidate hard fixed-scalar sets for a policy-blocked edge.
+        """Return role-aware fixed-scalar target constraints for policy edges.
 
-        Required hard-closure semantics are stricter than the earlier soft/greedy
-        anchor idea: if a same-axis edge is policy-blocked by reference-master,
-        we try to make delta exactly zero without creating a bidirectional
-        follower->template equality.  We do that by fixing both endpoints to a
-        common scalar target inside their pair interval.  For exactly-one-follower
-        pairs, the follower endpoint's current scalar is tried first, preserving
-        the original 'follower as anchor' interpretation.  For two-follower or
-        otherwise ambiguous policy pairs, we try current endpoint scalars and a
-        midpoint/average target inside the common interval.
+        Master-only homology semantics:
+          * A/B/C/D same homology group: only A--A is ordinary; B/C/D copies are
+            covered by A and are not anchored here.
+          * E--B (or E--A): B/A is held at its current derived/master scalar and
+            E is moved to that scalar.  The target side is also fixed to its
+            current value so this trial cannot move the homology group.
+          * follower--follower ambiguous edges are ignored by policy.
         """
         if not (enable_hard_iso and follower_anchor_closure):
             return []
@@ -1783,87 +1874,20 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
         if sega.free_axis != segb.free_axis or sega.free_axis != hp.axis:
             return []
 
-        lo = max(float(sta.s_min), float(stb.s_min))
-        hi = min(float(sta.s_max), float(stb.s_max))
-        if lo > hi + 1e-9:
+        cls, movable, target_pin = _alignment_policy_class(hp)
+        if cls != "free_to_homology_target" or movable is None or target_pin is None:
             return []
 
-        sa = float(sta.s_center)
-        sb = float(stb.s_center)
-        a_f = _is_follower_inst_for_policy(hp.pin_a[0])
-        b_f = _is_follower_inst_for_policy(hp.pin_b[0])
+        mst = inst_pin_state[movable]
+        tst = inst_pin_state[target_pin]
+        target = float(tst.s_center)
+        if target < float(mst.s_min) - 1e-9 or target > float(mst.s_max) + 1e-9:
+            return []
 
-        def inside(x):
-            return lo - 1e-9 <= float(x) <= hi + 1e-9
-
-        def clamp(x):
-            return max(lo, min(hi, float(x)))
-
-        targets = []
-        # Exactly-one-follower: preserve the original scheme by trying the
-        # follower scalar first.  If it is outside the other endpoint's interval,
-        # try bounded alternatives instead of silently skipping the edge.
-        if a_f != b_f:
-            anchor_s = sa if a_f else sb
-            if inside(anchor_s):
-                targets.append(float(anchor_s))
-
-        # Generic policy-blocked fallback.  These candidates make the pair exact
-        # if they are globally feasible under no-overlap/order constraints.
-        for x in (sa, sb, 0.5 * (sa + sb), 0.5 * (lo + hi), clamp(sa), clamp(sb)):
-            x = clamp(x)
-            if inside(x):
-                targets.append(float(x))
-
-        # Final representative rescue may need to search the full scalar
-        # interval.  Previous versions tried only current/midpoint targets; the
-        # remaining TA9L/TA9L3 blocker showed that all those legacy points can be
-        # infeasible even when another local-order-compatible target exists.
-        if include_scan and policy_min_edge_target_scan_enable:
-            nscan = max(3, int(policy_min_edge_target_scan_points))
-            if hi >= lo:
-                for i in range(nscan):
-                    t = lo if nscan == 1 else lo + (hi - lo) * i / float(nscan - 1)
-                    if inside(t):
-                        targets.append(float(t))
-            # Add biased points near the current endpoints and their midpoint.
-            span = max(hi - lo, 0.0)
-            for base in (sa, sb, 0.5 * (sa + sb)):
-                for frac in (0.001, 0.005, 0.01, 0.025, 0.05):
-                    off = span * frac
-                    for x in (base - off, base + off):
-                        x = clamp(x)
-                        if inside(x):
-                            targets.append(float(x))
-
-        # Deterministic de-duplication.
-        uniq_targets = []
-        seen = set()
-        for x in targets:
-            rx = round(float(x), 6)
-            if rx in seen:
-                continue
-            seen.add(rx)
-            uniq_targets.append(float(x))
-
-        freeze_both = _env_bool("POLICY_TARGET_FREEZE_BOTH", True)
-        sets = []
-        for target in uniq_targets:
-            if freeze_both:
-                cons = [(hp.pin_a, target), (hp.pin_b, target)]
-            else:
-                # Legacy mode: only fix the non-follower/movable endpoint when
-                # the policy pair has exactly one follower; otherwise fall back
-                # to freezing both because there is no unambiguous movable side.
-                if a_f != b_f:
-                    movable = hp.pin_b if a_f else hp.pin_a
-                    cons = [(movable, target)]
-                else:
-                    cons = [(hp.pin_a, target), (hp.pin_b, target)]
-            cons = _dedup_fixed_constraints(cons)
-            if cons:
-                sets.append(cons)
-        return sets
+        # Freeze the homology target at its current scalar and move the external
+        # source to that scalar.  This enforces E->B without letting E drag B/A.
+        cons = _dedup_fixed_constraints([(target_pin, target), (movable, target)])
+        return [cons] if cons else []
 
     def _follower_anchor_fixed_constraints_from_pair(hp):
         """Return the first policy-target constraint set for compatibility."""
@@ -2443,9 +2467,17 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
                     if lo > hi + 1e-9:
                         continue
                     hp = HardAlignPair(key1, key2, axis)
+                    cls, movable, target_pin = _alignment_policy_class(hp)
+                    if enable_hard_iso and cls in {"covered_by_homology", "ignored_by_policy"}:
+                        # B/C/D copies and copy-to-copy observations are not
+                        # independent required alignments. They are governed by
+                        # the master A template and must not become residual
+                        # blockers.
+                        continue
                     delta = _alignment_delta(hp)
                     fixed_axis_dist = _fixed_axis_distance(hp)
                     records.append({
+                        'policy_class': cls,
                         'hp': hp,
                         'edge_key': hp.as_undirected_key(),
                         'delta': float(delta),
@@ -2507,6 +2539,8 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
             if rec['edge_key'] in dropped_component_edges:
                 continue
             if rec['edge_key'] in policy_component_dropped_edge_keys:
+                continue
+            if rec['edge_key'] in policy_free_target_dropped_edge_keys:
                 continue
             if (not include_active) and hp in hard_pairs_active:
                 continue
@@ -2604,11 +2638,14 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
             "anchors": list(required_anchor_active),
             "policy_dropped_keys": set(policy_component_dropped_edge_keys),
             "policy_dropped_records": list(policy_component_dropped_records),
+            "free_target_dropped_keys": set(policy_free_target_dropped_edge_keys),
+            "free_target_dropped_records": list(policy_free_target_dropped_records),
         }
 
     def _restore_all_state(snap):
         nonlocal hard_pairs_active, bucket_by_seg, orders, required_anchor_active
         nonlocal policy_component_dropped_edge_keys, policy_component_dropped_records
+        nonlocal policy_free_target_dropped_edge_keys, policy_free_target_dropped_records
         hard_pairs_active = set(snap["active"])
         restore_inst_state(inst_pin_state, snap["inst"])
         restore_template(groups, snap["tmpl"])
@@ -2617,6 +2654,8 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
         required_anchor_active = list(snap.get("anchors", []))
         policy_component_dropped_edge_keys = set(snap.get("policy_dropped_keys", set()))
         policy_component_dropped_records = list(snap.get("policy_dropped_records", []))
+        policy_free_target_dropped_edge_keys = set(snap.get("free_target_dropped_keys", set()))
+        policy_free_target_dropped_records = list(snap.get("free_target_dropped_records", []))
 
     def _attempt_replace_admission(replace_edges, subset_edges):
         """Admission-layer replacement with optional canonical-score guard."""
@@ -3006,6 +3045,179 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
             orders = orders_backup
             return False, e
 
+    def _merge_new_anchor_constraints(cons):
+        """Return only new fixed constraints, or None if they conflict.
+
+        Existing persistent anchors remain active.  If a requested fixed scalar
+        on the same pin disagrees with an existing scalar, the E->target edge is
+        not simultaneously satisfiable under current accepted constraints.
+        """
+        deduped = _dedup_fixed_constraints(cons)
+        if deduped is None:
+            return None
+        existing = {pin: float(target) for pin, target in required_anchor_active}
+        new_constraints = []
+        for pin_key, target in deduped:
+            target = float(target)
+            if pin_key in existing:
+                if abs(existing[pin_key] - target) > 1e-6:
+                    return None
+                continue
+            new_constraints.append((pin_key, target))
+        return new_constraints
+
+    def _free_to_homology_target_precheck(hp):
+        """Check whether an E->B fixed-target trial is meaningful.
+
+        Returns (ok, reason, constraints).  ok=False is a deterministic
+        non-trial rejection, not a solver failure:
+          - role_not_free_to_target: not an E--A/B/C/D edge;
+          - missing_state: endpoint missing from current state;
+          - axis_mismatch: endpoints do not share the active free axis;
+          - target_out_of_movable_interval: E cannot reach B's scalar at all;
+          - conflicting_existing_anchor: E or target already has incompatible
+            accepted fixed scalar.
+        """
+        cls, movable, target_pin = _alignment_policy_class(hp)
+        if cls != "free_to_homology_target" or movable is None or target_pin is None:
+            return False, "role_not_free_to_target", []
+        if movable not in inst_pin_state or target_pin not in inst_pin_state:
+            return False, "missing_state", []
+        mst = inst_pin_state[movable]
+        tst = inst_pin_state[target_pin]
+        mseg = find_segment_by_global_id(real_segments, mst.seg_id)
+        tseg = find_segment_by_global_id(real_segments, tst.seg_id)
+        if mseg.free_axis != tseg.free_axis or mseg.free_axis != hp.axis:
+            return False, "axis_mismatch", []
+        target = float(tst.s_center)
+        if target < float(mst.s_min) - 1e-9 or target > float(mst.s_max) + 1e-9:
+            return False, "target_out_of_movable_interval", []
+        candidate_sets = _policy_target_constraint_sets_from_pair(hp)
+        if not candidate_sets:
+            return False, "no_candidate_constraints", []
+        cons = candidate_sets[0]
+        new_constraints = _merge_new_anchor_constraints(cons)
+        if new_constraints is None:
+            return False, "conflicting_existing_anchor", []
+        if not new_constraints and not _edge_aligned_after_solve(hp):
+            return False, "existing_anchor_not_aligned", []
+        return True, "ok", cons
+
+    def _run_free_to_homology_target_closure(policy_records):
+        """Commit E->A/B/C/D fixed-target alignments before generic policy search.
+
+        This implements the rule:
+            ABCD are homology copies with A as master; B/C/D are targets.
+            If an external free module E wants to align to B, B does not move;
+            E alone is constrained to B's current derived scalar.
+
+        Rejected edges are not sent to policy-component fallback in this round.
+        Under master-only homology semantics, a rejected fixed-target edge is not
+        an independent required equality: the homology target cannot be moved,
+        and the movable endpoint cannot legally reach it under the accepted
+        constraints.  Therefore rejected free-target edges are dropped from
+        required-blocker accounting by policy.
+        """
+        nonlocal required_anchor_active, inst_pin_state, bucket_by_seg, orders
+        nonlocal policy_free_target_dropped_edge_keys, policy_free_target_dropped_records
+
+        def _mark_free_target_dropped(rec, reason):
+            hp = rec['hp']
+            edge_key = rec.get('edge_key', hp.as_undirected_key())
+            if edge_key in policy_free_target_dropped_edge_keys:
+                return
+            policy_free_target_dropped_edge_keys.add(edge_key)
+            policy_free_target_dropped_records.append({
+                'edge_key': edge_key,
+                'hpwl': float(rec.get('hpwl', _compute_hpwl(hp))),
+                'delta': float(rec.get('delta', _alignment_delta(hp))),
+                'axis': hp.axis,
+                'a': hp.pin_a,
+                'b': hp.pin_b,
+                'reason': 'free_target_' + str(reason),
+            })
+        if not (free_to_homology_target_closure_enable and enable_hard_iso and follower_anchor_closure):
+            return 0, 0, 0
+        if not policy_records:
+            return 0, 0, 0
+
+        records = [rec for rec in policy_records if rec.get('policy_class') == "free_to_homology_target"]
+        if not records:
+            return 0, 0, 0
+
+        records = sorted(records, key=lambda rec: (
+            float(rec.get('fixed_axis_distance', _fixed_axis_distance(rec['hp']))),
+            float(rec.get('hpwl', _compute_hpwl(rec['hp']))),
+            -_edge_width(rec['hp']),
+            str(rec.get('edge_key', rec['hp'].as_undirected_key())),
+        ))
+
+        kept = 0
+        rejected = 0
+        skipped = 0
+        trials = 0
+        budget = max(0, int(free_to_homology_target_trial_budget))
+        fail_reasons = {}
+
+        for rec in records:
+            hp = rec['hp']
+            edge_key = rec.get('edge_key', hp.as_undirected_key())
+            if edge_key in free_to_homology_target_failed_edge_keys:
+                skipped += 1
+                continue
+            ok_pre, reason, cons = _free_to_homology_target_precheck(hp)
+            if not ok_pre:
+                rejected += 1
+                fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+                free_to_homology_target_failed_edge_keys.add(edge_key)
+                _mark_free_target_dropped(rec, reason)
+                continue
+            if _edge_aligned_after_solve(hp):
+                kept += 1
+                continue
+            if budget and trials >= budget:
+                skipped += 1
+                continue
+            trials += 1
+
+            inst_backup = snapshot_inst_state(inst_pin_state)
+            tmpl_backup = snapshot_template(groups)
+            bucket_backup = {seg: list(lst) for seg, lst in bucket_by_seg.items()}
+            orders_backup = {seg: list(lst) for seg, lst in orders.items()}
+            before_required = list(required_anchor_active)
+
+            new_constraints = _merge_new_anchor_constraints(cons)
+            if new_constraints is None:
+                rejected += 1
+                fail_reasons["conflicting_existing_anchor"] = fail_reasons.get("conflicting_existing_anchor", 0) + 1
+                free_to_homology_target_failed_edge_keys.add(edge_key)
+                _mark_free_target_dropped(rec, "conflicting_existing_anchor")
+                continue
+            trial_constraints = required_anchor_active + new_constraints
+            ok_solve, _ = _attempt_required_anchor_constraints(trial_constraints, order_hint_constraints=cons)
+            if ok_solve and _edge_aligned_after_solve(hp):
+                required_anchor_active = trial_constraints
+                kept += 1
+                continue
+
+            restore_inst_state(inst_pin_state, inst_backup)
+            restore_template(groups, tmpl_backup)
+            bucket_by_seg = bucket_backup
+            orders = orders_backup
+            required_anchor_active = before_required
+            rejected += 1
+            fail_reasons["solve_failed_or_not_aligned"] = fail_reasons.get("solve_failed_or_not_aligned", 0) + 1
+            free_to_homology_target_failed_edge_keys.add(edge_key)
+            _mark_free_target_dropped(rec, "solve_failed_or_not_aligned")
+
+        if solver_progress_log and (kept or rejected or skipped):
+            detail = " ".join(f"{k}={v}" for k, v in sorted(fail_reasons.items()))
+            print(
+                f"[free-target] kept={kept} rejected={rejected} skipped={skipped} "
+                f"candidates={len(records)} trials={trials} budget={budget} {detail}".rstrip()
+            )
+        return kept, rejected, skipped
+
     def _run_required_anchor_closure(policy_records):
         """Force reference-master-blocked residuals via policy-component targets.
 
@@ -3222,6 +3434,11 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
             _restore_anchor_constraint_lists(before_active, before_accepted)
 
         def _try_accept_full_component(records):
+            # Role-aware E->B/A target edges must not move the homology target.
+            # A full-component common target could drag B/A, so use only
+            # single-edge fixed-target trials for these records.
+            if any(rec.get('policy_class') == "free_to_homology_target" for rec in records):
+                return False
             pins = _pins_for_records(records)
             if not pins:
                 return False
@@ -3730,15 +3947,28 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
             remaining_after_ordinary = _collect_true_same_axis_blockers_report_style(include_active=True)
             remaining_policy = [rec for rec in remaining_after_ordinary if not _hard_pair_allowed_by_ref_master_policy(rec['hp'])]
 
-            # If ordinary hard-pairs did not change anything this round, force all
-            # remaining reference-master-blocked pairs through hard anchors.  This
-            # is terminal: after anchors are accepted, no more ordinary solve should
-            # run unless another closure round makes progress and then anchors are
-            # re-established from the updated geometry.
+            # First handle E->A/B/C/D target edges by the dedicated fixed-target
+            # rule: the homology endpoint is frozen; only the external/free side
+            # moves.  This prevents E--B from becoming a generic component-level
+            # attempt to move B or its master template.
+            free_target_kept = free_target_rejected = free_target_skipped = 0
+            if round_direct == 0 and round_replaced == 0 and remaining_policy:
+                free_target_records = [rec for rec in remaining_policy if rec.get('policy_class') == "free_to_homology_target"]
+                free_target_kept, free_target_rejected, free_target_skipped = _run_free_to_homology_target_closure(free_target_records)
+
+            remaining_after_free_target = _collect_true_same_axis_blockers_report_style(include_active=True)
+            remaining_policy = [
+                rec for rec in remaining_after_free_target
+                if (not _hard_pair_allowed_by_ref_master_policy(rec['hp']))
+                and rec.get('policy_class') != "free_to_homology_target"
+            ]
+
+            # Force the remaining non-free-target policy pairs through hard anchors.
             anchor_kept = anchor_rejected = anchor_skipped = 0
             if round_direct == 0 and round_replaced == 0 and remaining_policy:
                 anchor_kept, anchor_rejected, anchor_skipped = _run_required_anchor_closure(remaining_policy)
                 total_anchor += anchor_kept
+            total_anchor += free_target_kept
 
             residual_now = len(_collect_true_same_axis_blockers_report_style(include_active=True))
             if solver_progress_log:
@@ -3746,12 +3976,14 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
                     f"[required-closure] round={rr + 1} residual_before={len(residual_recs)} "
                     f"ordinary={len(ordinary)} policy={len(policy)} direct={round_direct} "
                     f"replaced={round_replaced} failed={round_failed} "
+                    f"free_target_kept={free_target_kept} free_target_rejected={free_target_rejected} "
+                    f"free_target_skipped={free_target_skipped} "
                     f"anchor_kept={anchor_kept} anchor_rejected={anchor_rejected} "
                     f"anchor_skipped={anchor_skipped} residual_after={residual_now}"
                 )
             if residual_now == 0:
                 break
-            if round_direct == 0 and round_replaced == 0 and anchor_kept == 0:
+            if round_direct == 0 and round_replaced == 0 and free_target_kept == 0 and anchor_kept == 0:
                 break
         conflict_kept, conflict_residual = _run_policy_min_edge_conflict_replacement()
         if solver_progress_log:
@@ -3884,8 +4116,10 @@ def solve_global_qp_with_outer_order_update(all_modules, active_pins, active_net
     if enable_hard_iso:
         inst_pin_state, bucket_by_seg = expand_template_to_instances(groups, real_segments, keepout)
 
-    LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS = set(policy_component_dropped_edge_keys)
-    LAST_POLICY_COMPONENT_DROPPED_RECORDS = list(policy_component_dropped_records)
+    LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS = set(policy_component_dropped_edge_keys) | set(policy_free_target_dropped_edge_keys)
+    LAST_POLICY_COMPONENT_DROPPED_RECORDS = list(policy_component_dropped_records) + list(policy_free_target_dropped_records)
+    LAST_POLICY_FREE_TARGET_DROPPED_EDGE_KEYS = set(policy_free_target_dropped_edge_keys)
+    LAST_POLICY_FREE_TARGET_DROPPED_RECORDS = list(policy_free_target_dropped_records)
 
     if strict_pair_hpwl_gate:
         _debug_print(f"[outer] pair-hpwl gate total_skipped={hpwl_gate_skipped_total} threshold={hpwl_thresh:g} margin={pair_hpwl_gate_margin:g} debug={int(hpwl_gate_debug)}")
