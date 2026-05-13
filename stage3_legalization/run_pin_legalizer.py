@@ -294,7 +294,96 @@ def _flat_interval(fp, seg_lookup, keepout: float):
             float(seg.hi) - float(keepout) - 0.5 * width)
 
 
-def _successor_alignment_report(result_out, flat_lookup, all_real_segments, keepout: float, hpwl_thresh: float, tol: float, policy_dropped_edge_keys=None):
+
+def _build_homology_info(db):
+    """Build lightweight master/follower metadata for report-time edge classification.
+
+    The solver owns the actual hard-iso model. This helper is only for the
+    final successor-edge report so that B/C/D follower-copy observations are
+    not counted as independent required alignments.
+    """
+    try:
+        groups = _solver_mod.build_iso_groups(db.all_modules_list)
+        if hasattr(_solver_mod, "_apply_iso_master_overrides"):
+            _solver_mod._apply_iso_master_overrides(groups)
+    except Exception as exc:
+        print(f"[homology] warning: failed to build homology info: {exc}")
+        return {
+            "enabled": False,
+            "inst_to_group": {},
+            "group_master": {},
+            "group_size": {},
+        }
+
+    inst_to_group = {}
+    group_master = {}
+    group_size = {}
+    for gname, group in groups.items():
+        instances = list(getattr(group, "instances", []) or [])
+        if len(instances) <= 1:
+            continue
+        master = getattr(group, "canon_inst", None) or instances[0]
+        group_master[gname] = master
+        group_size[gname] = len(instances)
+        for inst in instances:
+            inst_to_group[inst] = gname
+
+    return {
+        "enabled": True,
+        "inst_to_group": inst_to_group,
+        "group_master": group_master,
+        "group_size": group_size,
+    }
+
+
+def _homology_pin_role(pin_key, homology_info):
+    """Return (role, group_name) for a real pin key.
+
+    role is one of: free, master, follower.
+    """
+    if not homology_info or not homology_info.get("enabled"):
+        return "free", None
+    inst = pin_key[0] if isinstance(pin_key, (tuple, list)) and pin_key else None
+    gname = homology_info.get("inst_to_group", {}).get(inst)
+    if gname is None:
+        return "free", None
+    master = homology_info.get("group_master", {}).get(gname)
+    if inst == master:
+        return "master", gname
+    return "follower", gname
+
+
+def _homology_edge_class(akey, bkey, homology_info):
+    """Classify an edge under master-only homology semantics.
+
+    - Same homology group: only master--master observations can be required.
+      Follower internal, follower-follower, and master-follower observations
+      are covered by the master solution and not independently required.
+    - One side in a homology group and the other free: required. The free side
+      may move to the master/follower-derived target; the homology side must
+      not be reverse-pulled.
+    - Different homology groups: ignored by policy by default, since this would
+      couple two independent master/template systems.
+    - Neither side in a homology group: ordinary required edge.
+    """
+    ra, ga = _homology_pin_role(akey, homology_info)
+    rb, gb = _homology_pin_role(bkey, homology_info)
+
+    if ga is None and gb is None:
+        return "ordinary"
+
+    if ga is not None and gb is not None:
+        if ga == gb:
+            if ra == "master" and rb == "master":
+                return "ordinary"
+            return "covered_by_homology"
+        return "ignored_by_policy"
+
+    # Exactly one endpoint belongs to a homology group. The non-homology side
+    # is the movable side; the homology endpoint acts as a master/derived target.
+    return "ordinary"
+
+def _successor_alignment_report(result_out, flat_lookup, all_real_segments, keepout: float, hpwl_thresh: float, tol: float, policy_dropped_edge_keys=None, homology_info=None):
     """Report alignment with the production semantics.
 
     Count as alignable only if:
@@ -323,6 +412,9 @@ def _successor_alignment_report(result_out, flat_lookup, all_real_segments, keep
         "same_axis_misaligned_raw": 0,
         "same_axis_misaligned": 0,
         "true_same_axis_misaligned": 0,
+        "same_axis_required": 0,
+        "covered_by_homology": 0,
+        "ignored_by_policy": 0,
         "component_empty_count": 0,
         "component_empty_edges": 0,
         "component_empty_kept_by_policy": 0,
@@ -389,10 +481,25 @@ def _successor_alignment_report(result_out, flat_lookup, all_real_segments, keep
                     })
                     continue
 
+                edge_class = _homology_edge_class(akey, bkey, homology_info)
+                if edge_class == "covered_by_homology":
+                    stats["covered_by_homology"] += 1
+                    continue
+                if edge_class == "ignored_by_policy":
+                    stats["ignored_by_policy"] += 1
+                    continue
+
+                norm_edge_key = (akey, bkey) if akey <= bkey else (bkey, akey)
+                if norm_edge_key in policy_dropped_edge_keys:
+                    stats["ignored_by_policy"] += 1
+                    continue
+
                 stats["same_axis_evaluable"] += 1
+                stats["same_axis_required"] += 1
                 delta = abs(ax - bx) if fa == "x" else abs(ay - by)
                 fixed_axis_dist = _fixed_axis_distance_from_scopes(fa, af["scope"], bf["scope"])
                 rec = {
+                    "edge_class": edge_class,
                     "edge_key": (akey, bkey),
                     "akey": akey,
                     "bkey": bkey,
@@ -630,9 +737,10 @@ def main():
     report_lines.append(f"unchanged_result_entries: {unchanged_count}")
 
     policy_dropped_edge_keys = getattr(_solver_mod, "LAST_POLICY_COMPONENT_DROPPED_EDGE_KEYS", set())
+    homology_info = _build_homology_info(db)
     succ_stats, succ_misaligned, succ_pair_empty, succ_component_dropped = _successor_alignment_report(
         result_out, flat_lookup, all_real_segments, keepout=keepout, hpwl_thresh=hpwl_thresh, tol=tol,
-        policy_dropped_edge_keys=policy_dropped_edge_keys,
+        policy_dropped_edge_keys=policy_dropped_edge_keys, homology_info=homology_info,
     )
     noov = _no_overlap_report(flat_results, keepout=keepout, tol=tol)
     disp_mean, disp_max, disp_top = _displacement_report(flat_lookup, result_lookup)
@@ -645,35 +753,33 @@ def main():
         succ_stats.get("cross_axis_low_hpwl_skipped", 0)
         + succ_stats.get("same_axis_pair_empty_skipped", 0)
         + succ_stats.get("component_empty_dropped_by_policy", 0)
-        + succ_stats.get("policy_component_dropped_by_policy", 0)
     )
     print(
         f"[result] pins={len(final_state)} updated={updated_count} "
         f"successor_edges={succ_stats['successor_edges']} low_hpwl={succ_stats['low_hpwl_total']}"
     )
     print(
-        f"[result] same_axis_evaluable={succ_stats['same_axis_evaluable']} "
-        f"aligned={succ_stats['same_axis_aligned']} misaligned={succ_stats['true_same_axis_misaligned']} "
+        f"[result] same_axis_required={succ_stats.get('same_axis_required', succ_stats['same_axis_evaluable'])} "
+        f"aligned={succ_stats['same_axis_aligned']} unresolved={succ_stats['true_same_axis_misaligned']} "
+        f"covered_by_homology={succ_stats.get('covered_by_homology', 0)} "
+        f"ignored_by_policy={succ_stats.get('ignored_by_policy', 0)} "
         f"skipped={skipped_non_actionable}"
     )
     print(f"[result] no_overlap_violations={len(noov)}")
-    print(f"[result] displacement_mean={disp_mean:.6f} displacement_max={disp_max:.6f}")
 
     # Optional report, written only when WRITE_REPORT_OUTPUT=1.  Keep it compact
     # and avoid exposing internal policy/drop category names.
     report_lines.append(f"successor_edges: {succ_stats['successor_edges']}")
     report_lines.append(f"low_hpwl: {succ_stats['low_hpwl_total']}")
-    report_lines.append(f"same_axis_evaluable: {succ_stats['same_axis_evaluable']}")
+    report_lines.append(f"same_axis_required: {succ_stats.get('same_axis_required', succ_stats['same_axis_evaluable'])}")
     report_lines.append(f"aligned: {succ_stats['same_axis_aligned']}")
-    report_lines.append(f"misaligned: {succ_stats['true_same_axis_misaligned']}")
+    report_lines.append(f"unresolved: {succ_stats['true_same_axis_misaligned']}")
+    report_lines.append(f"covered_by_homology: {succ_stats.get('covered_by_homology', 0)}")
+    report_lines.append(f"ignored_by_policy: {succ_stats.get('ignored_by_policy', 0)}")
     report_lines.append(f"skipped: {skipped_non_actionable}")
     report_lines.append(f"no_overlap_violations: {len(noov)}")
     for item in noov[:10]:
         report_lines.append(f"  no_overlap_violation: excess={item[0]:.6f} seg={item[1]} a={item[2]} b={item[3]} gap={item[4]:.6f} req={item[5]:.6f}")
-    report_lines.append(f"displacement_mean_manhattan: {disp_mean:.6f}")
-    report_lines.append(f"displacement_max_manhattan: {disp_max:.6f}")
-    for dman, dlinf, key in disp_top:
-        report_lines.append(f"  displacement_top: manhattan={dman:.6f} linf={dlinf:.6f} key={key}")
     for rec in succ_misaligned[:10]:
         report_lines.append(
             f"  blocker: delta={rec['delta']:.6f} hpwl={rec['hpwl']:.6f} "
