@@ -13,10 +13,6 @@ import logging
 import torch
 import torch.nn as nn
 from typing import List, Dict, Tuple, Optional
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import io
-from PIL import Image
 
 
 from EdgePlace import EdgePlace
@@ -311,6 +307,7 @@ class OptimizationVisualizer:
         
         if self.edge_places is None or frame_idx >= len(self.history['positions']):
             return
+        import matplotlib.patches as patches
         
         positions = self.history['positions'][frame_idx]
         iteration = self.history['iterations'][frame_idx]
@@ -420,6 +417,9 @@ class OptimizationVisualizer:
         if not self.history['positions'] or self.edge_places is None:
             logging.warning("No position history recorded. Cannot create animation.")
             return
+        import io
+        import matplotlib.pyplot as plt
+        from PIL import Image
         
         # Sample frames
         total_frames = len(self.history['positions'])
@@ -484,6 +484,7 @@ class OptimizationVisualizer:
         if not self.history['iterations']:
             logging.warning("No metrics recorded. Cannot plot.")
             return None
+        import matplotlib.pyplot as plt
 
         iterations  = np.array(self.history['iterations'])
         wl          = np.array([v if v is not None else np.nan for v in self.history['wirelength']])
@@ -1002,9 +1003,14 @@ def test_optimization_from_segment_assignments(
     # ------------------------------------------------------------------
     # 4. PlaceObj
     # ------------------------------------------------------------------
+    adam_learning_rate = float(getattr(params, "learning_rate", 0.5))
+    if adam_learning_rate <= 0:
+        raise ValueError(
+            "Stage2 learning_rate must be positive, got %.6g" % adam_learning_rate
+        )
     global_place_params = {
         "wirelength": "weighted_average",
-        "learning_rate": 0.1,
+        "learning_rate": adam_learning_rate,
     }
     place_obj = PlaceObj(
         density_weight=0.0,
@@ -1033,7 +1039,8 @@ def test_optimization_from_segment_assignments(
     for eid, ep in enumerate(edge_places):
         if eid not in reuse_edge_ids:
             all_opt_params.extend(ep.parameters())
-    optimizer = torch.optim.Adam(all_opt_params, lr=0.5)
+    logging.info("Adam learning_rate=%.6g", adam_learning_rate)
+    optimizer = torch.optim.Adam(all_opt_params, lr=adam_learning_rate)
 
     # ------------------------------------------------------------------
     # 6. Initial metrics
@@ -1099,9 +1106,17 @@ def test_optimization_from_segment_assignments(
             and iteration > 0
             and iteration % density_weight_update_interval == 0
         )
+        is_record = (iteration % record_interval == 0) or (iteration == max_iterations - 1)
+        is_log    = ((iteration + 1) % log_interval == 0) or (iteration == max_iterations - 1)
+        do_grad_metrics = do_pe or is_log
+
         objective, wl_grad_norm, density_grad_norm, wl_pe, raw_d = \
             place_obj.obj_wl_density_test(
-                all_edge_positions, density_w, compute_per_edge_norms=do_pe)
+                all_edge_positions,
+                density_w,
+                compute_per_edge_norms=do_pe,
+                compute_grad_metrics=do_grad_metrics,
+            )
 
         objective.backward()
         optimizer.step()
@@ -1117,10 +1132,6 @@ def test_optimization_from_segment_assignments(
                 density_w, wl_pe, raw_d,
                 place_obj.base_edge_indices, ts)
             place_obj.density_weight.data.copy_(density_w)
-
-        # Recording & logging
-        is_record = (iteration % record_interval == 0) or (iteration == max_iterations - 1)
-        is_log    = ((iteration + 1) % log_interval == 0) or (iteration == max_iterations - 1)
 
         if is_record or is_log:
             t_now = time.time()

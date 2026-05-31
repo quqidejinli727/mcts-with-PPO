@@ -59,6 +59,21 @@ class ElectricPotential1D(nn.Module):
         self.register_buffer('w', w)
         self.register_buffer('w2', w2)
         self.register_buffer('inv_w2', 1.0 / w2)
+
+        n = torch.arange(num_bins, device=device, dtype=dtype)
+        kk = torch.arange(num_bins, device=device, dtype=dtype)
+        self.register_buffer(
+            'dct_matrix',
+            torch.cos(math.pi * kk.unsqueeze(1) * (2 * n.unsqueeze(0) + 1) / (2 * num_bins))
+        )
+        self.register_buffer(
+            'idct_matrix_t',
+            torch.cos(math.pi * kk.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * num_bins)).T
+        )
+        self.register_buffer(
+            'idst_matrix_t',
+            torch.sin(math.pi * kk.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * num_bins)).T
+        )
         
         # Target density per bin
         total_pin_width = pin_widths.sum().item()
@@ -179,6 +194,17 @@ class ElectricPotential1D(nn.Module):
         field_map = self.idst_1d(field_dct)
         
         return potential_map, field_map
+
+    def solve_potential_1d(self, density_map):
+        """
+        @brief Solve only the potential map needed by density energy.
+        """
+        rho = density_map - self.target_density_per_bin
+        rho_dct = self.dct_1d(rho)
+        potential_dct = rho_dct * self.inv_w2
+        potential_dct[0] = 0.0
+        potential_map = self.idct_1d(potential_dct)
+        return rho, potential_map
     
     def dct_1d(self, x):
         """
@@ -187,10 +213,10 @@ class ElectricPotential1D(nn.Module):
         @return DCT coefficients (N,)
         """
         N = x.shape[0]
-        # Create DCT-II matrix
+        if N == self.num_bins:
+            return torch.mv(self.dct_matrix, x)
         n = torch.arange(N, device=x.device, dtype=x.dtype)
         k = torch.arange(N, device=x.device, dtype=x.dtype)
-        # DCT-II: X[k] = sum_n x[n] * cos(π*k*(2n+1)/(2N))
         cos_matrix = torch.cos(math.pi * k.unsqueeze(1) * (2 * n.unsqueeze(0) + 1) / (2 * N))
         return torch.mv(cos_matrix, x)
     
@@ -201,11 +227,13 @@ class ElectricPotential1D(nn.Module):
         @return signal (N,)
         """
         N = X.shape[0]
-        n = torch.arange(N, device=X.device, dtype=X.dtype)
-        k = torch.arange(N, device=X.device, dtype=X.dtype)
-        # IDCT: x[n] = X[0]/N + (2/N) * sum_{k=1}^{N-1} X[k] * cos(π*k*(2n+1)/(2N))
-        cos_matrix = torch.cos(math.pi * k.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * N))
-        result = torch.mv(cos_matrix.T, X)
+        if N == self.num_bins:
+            result = torch.mv(self.idct_matrix_t, X)
+        else:
+            n = torch.arange(N, device=X.device, dtype=X.dtype)
+            k = torch.arange(N, device=X.device, dtype=X.dtype)
+            cos_matrix = torch.cos(math.pi * k.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * N))
+            result = torch.mv(cos_matrix.T, X)
         result = result * 2 / N
         result[0] = X[0] / N  # Handle DC component
         return result
@@ -217,11 +245,13 @@ class ElectricPotential1D(nn.Module):
         @return signal (N,)
         """
         N = X.shape[0]
-        n = torch.arange(N, device=X.device, dtype=X.dtype)
-        k = torch.arange(N, device=X.device, dtype=X.dtype)
-        # IDST: x[n] = (2/N) * sum_{k=1}^{N-1} X[k] * sin(π*k*(2n+1)/(2N))
-        sin_matrix = torch.sin(math.pi * k.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * N))
-        result = torch.mv(sin_matrix.T, X)
+        if N == self.num_bins:
+            result = torch.mv(self.idst_matrix_t, X)
+        else:
+            n = torch.arange(N, device=X.device, dtype=X.dtype)
+            k = torch.arange(N, device=X.device, dtype=X.dtype)
+            sin_matrix = torch.sin(math.pi * k.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * N))
+            result = torch.mv(sin_matrix.T, X)
         result = result * 2 / N
         return result
     
@@ -244,6 +274,14 @@ class ElectricPotential1D(nn.Module):
         field_at_pins = (1 - frac) * field_map[bin_low] + frac * field_map[bin_high]
         
         return field_at_pins
+
+    def energy(self, pos):
+        """
+        @brief Compute only the density energy used by the optimizer.
+        """
+        density_map = self.compute_density_map_vectorized(pos)
+        rho, potential_map = self.solve_potential_1d(density_map)
+        return 0.5 * (rho * potential_map).sum()
     
     def forward(self, pos):
         """
@@ -251,21 +289,10 @@ class ElectricPotential1D(nn.Module):
         @param pos pin positions (num_pins,)
         @return energy (scalar), density_map, overflow
         """
-        # Compute density map
         density_map = self.compute_density_map_vectorized(pos)
-        
-        # Solve Poisson equation
         potential_map, field_map = self.solve_poisson_1d(density_map)
-        
-        # Compute deviation from target density (rho = density - target)
         rho = density_map - self.target_density_per_bin
-        
-        # Compute energy: E = 0.5 * sum(rho * phi)
-        # This ensures non-negative energy since rho and phi have same sign pattern
-        # (from Poisson equation: ∇²φ = ρ)
         energy = 0.5 * (rho * potential_map).sum()
-        
-        # Compute overflow (density exceeding target)
         overflow = torch.clamp(density_map - self.target_density_per_bin, min=0).sum()
         max_density = density_map.max() / self.bin_size
         
@@ -416,11 +443,12 @@ class EdgePlace(nn.Module):
             edge.pin_widths = [pin.width for pin in edge.pins]
         
         self.device = torch.device("cuda" if params.gpu else "cpu")
+        self.dtype = torch.float64 if getattr(params, "dtype", "float32") == "float64" else torch.float32
         # 是否要添加filler node，要添加的话到时候这里还有一段代码
 
         # position should be parameter defined in EdgePlace
         self.pos = nn.ParameterList(
-            [nn.Parameter(torch.from_numpy(self.init_pos).to(self.device))])
+            [nn.Parameter(torch.as_tensor(self.init_pos, dtype=self.dtype, device=self.device))])
         
         # shared data on device for building ops
         # I do not want to construct the data from placedb again and again for each op
@@ -545,8 +573,7 @@ class EdgePlace(nn.Module):
             @param pos pin positions (num_pins,)
             @return energy (scalar, differentiable)
             """
-            energy, overflow, max_density = electric_potential(pos)
-            return energy
+            return electric_potential.energy(pos)
         
         return density_op
     

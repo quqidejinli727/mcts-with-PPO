@@ -200,7 +200,7 @@ python run.py --case benchmark/case2 --output output/case2 --skip-legalization
 |------|--------|--------|------|
 | 优化迭代次数 | `--nlplace-iterations` | 600 | Adam 优化器迭代轮数 |
 | 初始密度权重 | `--nlplace-density-weight` | 100.0 | 密度目标函数的初始权重系数 |
-| 参数文件 | `--nlplace-params` | 内置默认 | 自定义 params.json 路径 |
+| 参数文件 | `--nlplace-params` | 内置默认 | 自定义 params.json 路径，可配置 Stage2 学习率等参数 |
 | 保存图表 | `--enable-plot` | False | 保存优化过程的指标图 |
 
 `params.json` 格式：
@@ -210,6 +210,7 @@ python run.py --case benchmark/case2 --output output/case2 --skip-legalization
     "gpu": false,
     "random_seed": 42,
     "num_threads": 4,
+    "learning_rate": 0.5,
     "target_density": 0.8,
     "num_bins_x": 64,
     "num_bins_y": 64
@@ -221,6 +222,7 @@ python run.py --case benchmark/case2 --output output/case2 --skip-legalization
 | `gpu` | 是否使用 CUDA GPU 加速 |
 | `random_seed` | 随机种子 |
 | `num_threads` | PyTorch CPU 线程数 |
+| `learning_rate` | Stage2 Adam 学习率 |
 | `target_density` | 目标 pin 密度（0-1） |
 | `num_bins_x/y` | 密度估计的网格分辨率 |
 

@@ -7,9 +7,6 @@ import json
 from enum import IntEnum
 from typing import List, Optional, Dict, Any, Tuple
 from shapely import Polygon
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from matplotlib.collections import PatchCollection
 import torch
 
 class Pin:
@@ -584,6 +581,8 @@ class PlaceDB:
             dpi: 图像分辨率，默认 100
             save_path: 保存路径，如果为 None 则只显示不保存
         """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
         
         # 创建图形和坐标轴
         fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
@@ -711,6 +710,9 @@ class PlaceDB:
             dpi: 图像分辨率，默认 100
             save_path: 保存路径，如果为 None 则只显示不保存
         """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+
         # 收集所有模块
         all_modules = self.collect_all_modules(root_module)
         
@@ -808,4 +810,3 @@ if __name__ == "__main__":
     database = PlaceDB("block.json", "pingroup.json")
     print(database)
     database.visualize_modules(save_path="module_layout.png")
-

@@ -255,6 +255,7 @@ class PlaceObj(nn.Module):
             self.net_mask = None
             self.num_pins = 0
             self.num_nets = 0
+        self.net_degree_buckets = self._build_net_degree_buckets()
         
         # Per–base-edge density weights (length K = _num_density_edges)
         K = self._num_density_edges
@@ -292,6 +293,43 @@ class PlaceObj(nn.Module):
         # Skip density weight initialization if no edge_places
         if edge_places is not None and len(edge_places) > 0:
             self.initialize_density_weight(params, placedb)
+
+    def _build_net_degree_buckets(self):
+        """
+        Bucket flat net-to-pin data by degree for vectorized wirelength.
+        Each item is (degree, pin_index_matrix) with shape [num_nets_in_bucket, degree].
+        """
+        if (
+            self.flat_net2pin_map is None
+            or self.flat_net2pin_start_map is None
+            or self.num_nets <= 0
+        ):
+            return []
+
+        starts = self.flat_net2pin_start_map.detach().cpu().tolist()
+        flat = self.flat_net2pin_map.detach().cpu().tolist()
+        buckets = {}
+        for net_id in range(self.num_nets):
+            start = int(starts[net_id])
+            end = int(starts[net_id + 1])
+            degree = end - start
+            if degree < 2:
+                continue
+            if self.net_mask is not None and not bool(self.net_mask[net_id].detach().cpu().item()):
+                continue
+            buckets.setdefault(degree, []).append(flat[start:end])
+
+        out = []
+        for degree in sorted(buckets):
+            out.append((
+                degree,
+                torch.tensor(
+                    buckets[degree],
+                    dtype=torch.long,
+                    device=self.device,
+                ),
+            ))
+        return out
     
     def obj_fn(self, all_edge_positions):
         """
@@ -439,39 +477,47 @@ class PlaceObj(nn.Module):
         all_edge_positions,
         density_weight: Union[None, float, int, Sequence[float], torch.Tensor] = 1.0,
         compute_per_edge_norms: bool = False,
+        compute_grad_metrics: bool = False,
     ) -> Tuple[torch.Tensor, float, float, Optional[np.ndarray], Optional[np.ndarray]]:
         """
         @brief wl_weight * WL + sum_i w_i * density_i (base edges). Also reports gradient norms.
         @param density_weight  Scalar (broadcast), length-K vector, or None (use self.density_weight).
         @param compute_per_edge_norms  If True, run per-base-edge density backward for schedule metrics.
+        @param compute_grad_metrics  If True, report aggregate WL/Density gradient norms.
         @return objective, wl_grad_norm, density_grad_norm, wl_per_edge, raw_d_per_edge
                 Last two entries are None when compute_per_edge_norms is False.
         """
         wl_weight = 1000
         K = self._num_density_edges
         w = self._normalize_density_weights(density_weight)
+        edge_items = list(all_edge_positions.items())
+        edge_tensors = [edge_pos for _, edge_pos in edge_items]
 
         wirelength = self.obj_wl_test(all_edge_positions)
-        wirelength.backward(retain_graph=True)
 
         wl_per_edge_out: Optional[np.ndarray] = None
-        if compute_per_edge_norms and all_edge_positions:
-            max_eid = max(all_edge_positions.keys())
-            wl_per_edge_out = np.zeros(max_eid + 1, dtype=np.float64)
-            for edge_id, edge_pos in all_edge_positions.items():
-                if edge_pos.grad is not None:
-                    wl_per_edge_out[edge_id] = edge_pos.grad.norm(p=2).item() * wl_weight
-            wl_grad_norm = float(np.sqrt(np.sum(wl_per_edge_out ** 2)))
-        else:
-            wl_grad_norm = 0.0
-            for edge_pos in all_edge_positions.values():
-                if edge_pos.grad is not None:
-                    wl_grad_norm += edge_pos.grad.norm(p=2).item() ** 2
-            wl_grad_norm = float(np.sqrt(wl_grad_norm)) * wl_weight
-
-        for edge_pos in all_edge_positions.values():
-            if edge_pos.grad is not None:
-                edge_pos.grad.zero_()
+        wl_grad_norm = 0.0
+        need_wl_metrics = compute_per_edge_norms or compute_grad_metrics
+        if need_wl_metrics and edge_tensors:
+            wl_grads = torch.autograd.grad(
+                wirelength,
+                edge_tensors,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            if compute_per_edge_norms:
+                max_eid = max(all_edge_positions.keys())
+                wl_per_edge_out = np.zeros(max_eid + 1, dtype=np.float64)
+                for (edge_id, _), grad in zip(edge_items, wl_grads):
+                    if grad is not None:
+                        wl_per_edge_out[edge_id] = grad.norm(p=2).item() * wl_weight
+                wl_grad_norm = float(np.sqrt(np.sum(wl_per_edge_out ** 2)))
+            else:
+                wl_grad_norm = float(np.sqrt(sum(
+                    grad.norm(p=2).item() ** 2
+                    for grad in wl_grads
+                    if grad is not None
+                ))) * wl_weight
 
         if K == 0:
             weighted_density = wirelength * 0.0
@@ -492,30 +538,31 @@ class PlaceObj(nn.Module):
                 for ki, eid in enumerate(self.base_edge_indices):
                     edge_pos = all_edge_positions[eid]
                     d_i = self.edge_places[eid].op_collections.density_op(edge_pos)
-                    d_i.backward(retain_graph=True)
-                    if edge_pos.grad is not None:
-                        raw_d_per_edge[ki] = edge_pos.grad.norm(p=2).item()
-                    for ep in all_edge_positions.values():
-                        if ep.grad is not None:
-                            ep.grad.zero_()
+                    grad = torch.autograd.grad(
+                        d_i,
+                        edge_pos,
+                        retain_graph=False,
+                        allow_unused=True,
+                    )[0]
+                    if grad is not None:
+                        raw_d_per_edge[ki] = grad.norm(p=2).item()
                 w_np = w.detach().cpu().numpy()
                 density_grad_norm = float(np.sqrt(np.sum((w_np * raw_d_per_edge) ** 2)))
-            else:
-                weighted_density.backward(retain_graph=True)
-                for edge_pos in all_edge_positions.values():
-                    if edge_pos.grad is not None:
-                        density_grad_norm += edge_pos.grad.norm(p=2).item() ** 2
-                density_grad_norm = float(np.sqrt(density_grad_norm))
-                for edge_pos in all_edge_positions.values():
-                    if edge_pos.grad is not None:
-                        edge_pos.grad.zero_()
+            elif compute_grad_metrics and edge_tensors:
+                density_grads = torch.autograd.grad(
+                    weighted_density,
+                    edge_tensors,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                density_grad_norm = float(np.sqrt(sum(
+                    grad.norm(p=2).item() ** 2
+                    for grad in density_grads
+                    if grad is not None
+                )))
 
         if not compute_per_edge_norms:
             wl_per_edge_out = None
-
-        for edge_pos in all_edge_positions.values():
-            if edge_pos.grad is not None:
-                edge_pos.grad.zero_()
 
         objective = wl_weight * wirelength + weighted_density
         return objective, wl_grad_norm, density_grad_norm, wl_per_edge_out, raw_d_per_edge
@@ -681,6 +728,32 @@ class PlaceObj(nn.Module):
         
         inv_gamma = 1.0 / self.gamma
         total_wl = torch.tensor(0.0, device=device, dtype=dtype)
+
+        if net_weights is None and net_mask is None and self.net_degree_buckets:
+            for _degree, pin_indices in self.net_degree_buckets:
+                net_pin_x = pin_x[pin_indices]
+                net_pin_y = pin_y[pin_indices]
+
+                x_max = net_pin_x.max(dim=1, keepdim=True).values
+                x_min = net_pin_x.min(dim=1, keepdim=True).values
+                exp_x_pos = torch.exp((net_pin_x - x_max) * inv_gamma)
+                exp_x_neg = torch.exp((x_min - net_pin_x) * inv_gamma)
+                wl_x = (
+                    (net_pin_x * exp_x_pos).sum(dim=1) / exp_x_pos.sum(dim=1)
+                    - (net_pin_x * exp_x_neg).sum(dim=1) / exp_x_neg.sum(dim=1)
+                )
+
+                y_max = net_pin_y.max(dim=1, keepdim=True).values
+                y_min = net_pin_y.min(dim=1, keepdim=True).values
+                exp_y_pos = torch.exp((net_pin_y - y_max) * inv_gamma)
+                exp_y_neg = torch.exp((y_min - net_pin_y) * inv_gamma)
+                wl_y = (
+                    (net_pin_y * exp_y_pos).sum(dim=1) / exp_y_pos.sum(dim=1)
+                    - (net_pin_y * exp_y_neg).sum(dim=1) / exp_y_neg.sum(dim=1)
+                )
+
+                total_wl = total_wl + (wl_x + wl_y).sum()
+            return total_wl
         
         for net_id in range(self.num_nets):
             # Skip if net is masked

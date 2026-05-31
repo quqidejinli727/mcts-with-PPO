@@ -19,6 +19,52 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 
+class TeeStream:
+    """Write text to multiple streams, used to keep terminal output and log files in sync."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self):
+        return self.streams[0].isatty()
+
+    @property
+    def encoding(self):
+        return getattr(self.streams[0], "encoding", "utf-8")
+
+
+def setup_logging(output_dir: str, log_dir: str = None):
+    """Configure logging and mirror stdout/stderr to a timestamped run log."""
+    log_root = Path(log_dir).resolve() if log_dir else Path(output_dir).resolve() / "logs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_path = log_root / f"run_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log"
+    log_file = open(log_path, "a", encoding="utf-8", buffering=1)
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = TeeStream(original_stdout, log_file)
+    sys.stderr = TeeStream(original_stderr, log_file)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(levelname)-7s] %(name)s - %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+    logging.info(f"Run log: {log_path}")
+
+    return log_file, log_path, original_stdout, original_stderr
+
+
 def run_full_flow(
     case_dir: str,
     output_dir: str,
@@ -227,34 +273,44 @@ Examples:
     stage3.add_argument("--max-outer-iter", type=int, default=30)
     stage3.add_argument("--skip-legalization", action="store_true")
 
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="Directory for per-run log files (default: <output>/logs)",
+    )
+
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(levelname)-7s] %(name)s - %(message)s",
-        stream=sys.stdout,
+    log_file, log_path, original_stdout, original_stderr = setup_logging(
+        args.output, args.log_dir
     )
+    try:
+        final_path = run_full_flow(
+            case_dir=args.case,
+            output_dir=args.output,
+            num_simulations=args.num_simulations,
+            time_limit=args.time_limit,
+            nlplace_max_iterations=args.nlplace_iterations,
+            nlplace_density_weight=args.nlplace_density_weight,
+            nlplace_params_path=args.nlplace_params,
+            enable_plot=args.enable_plot,
+            keepout=args.keepout,
+            hpwl_thresh=args.hpwl_thresh,
+            max_outer_iter=args.max_outer_iter,
+            skip_mcts=args.skip_mcts,
+            skip_nlplace=args.skip_nlplace,
+            skip_legalization=args.skip_legalization,
+            segment_assignments_path=args.segment_assignments,
+            result_json_path=args.result,
+        )
 
-    final_path = run_full_flow(
-        case_dir=args.case,
-        output_dir=args.output,
-        num_simulations=args.num_simulations,
-        time_limit=args.time_limit,
-        nlplace_max_iterations=args.nlplace_iterations,
-        nlplace_density_weight=args.nlplace_density_weight,
-        nlplace_params_path=args.nlplace_params,
-        enable_plot=args.enable_plot,
-        keepout=args.keepout,
-        hpwl_thresh=args.hpwl_thresh,
-        max_outer_iter=args.max_outer_iter,
-        skip_mcts=args.skip_mcts,
-        skip_nlplace=args.skip_nlplace,
-        skip_legalization=args.skip_legalization,
-        segment_assignments_path=args.segment_assignments,
-        result_json_path=args.result,
-    )
-
-    print(f"\nFinal result: {final_path}")
+        print(f"\nFinal result: {final_path}")
+        print(f"Run log: {log_path}")
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        log_file.close()
 
 
 if __name__ == "__main__":
