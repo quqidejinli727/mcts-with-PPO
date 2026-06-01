@@ -228,6 +228,7 @@ class PlaceObj(nn.Module):
 
         self.gpu = getattr(params, 'gpu', 0)
         self.device = torch.device("cuda" if self.gpu else "cpu")
+        self.wl_bucket_chunk_size = int(getattr(params, "wl_bucket_chunk_size", 8192) or 0)
         
         # Wirelength computation data
         # Use passed parameters if provided, otherwise try to get from placedb
@@ -325,11 +326,35 @@ class PlaceObj(nn.Module):
                 degree,
                 torch.tensor(
                     buckets[degree],
-                    dtype=torch.long,
+                    dtype=torch.int32,
                     device=self.device,
                 ),
             ))
         return out
+
+    def _weighted_average_wirelength_bucket(self, pin_x, pin_y, pin_indices, inv_gamma):
+        net_pin_x = pin_x[pin_indices]
+        net_pin_y = pin_y[pin_indices]
+
+        x_max = net_pin_x.max(dim=1, keepdim=True).values
+        x_min = net_pin_x.min(dim=1, keepdim=True).values
+        exp_x_pos = torch.exp((net_pin_x - x_max) * inv_gamma)
+        exp_x_neg = torch.exp((x_min - net_pin_x) * inv_gamma)
+        wl_x = (
+            (net_pin_x * exp_x_pos).sum(dim=1) / exp_x_pos.sum(dim=1)
+            - (net_pin_x * exp_x_neg).sum(dim=1) / exp_x_neg.sum(dim=1)
+        )
+
+        y_max = net_pin_y.max(dim=1, keepdim=True).values
+        y_min = net_pin_y.min(dim=1, keepdim=True).values
+        exp_y_pos = torch.exp((net_pin_y - y_max) * inv_gamma)
+        exp_y_neg = torch.exp((y_min - net_pin_y) * inv_gamma)
+        wl_y = (
+            (net_pin_y * exp_y_pos).sum(dim=1) / exp_y_pos.sum(dim=1)
+            - (net_pin_y * exp_y_neg).sum(dim=1) / exp_y_neg.sum(dim=1)
+        )
+
+        return (wl_x + wl_y).sum()
     
     def obj_fn(self, all_edge_positions):
         """
@@ -731,28 +756,15 @@ class PlaceObj(nn.Module):
 
         if net_weights is None and net_mask is None and self.net_degree_buckets:
             for _degree, pin_indices in self.net_degree_buckets:
-                net_pin_x = pin_x[pin_indices]
-                net_pin_y = pin_y[pin_indices]
-
-                x_max = net_pin_x.max(dim=1, keepdim=True).values
-                x_min = net_pin_x.min(dim=1, keepdim=True).values
-                exp_x_pos = torch.exp((net_pin_x - x_max) * inv_gamma)
-                exp_x_neg = torch.exp((x_min - net_pin_x) * inv_gamma)
-                wl_x = (
-                    (net_pin_x * exp_x_pos).sum(dim=1) / exp_x_pos.sum(dim=1)
-                    - (net_pin_x * exp_x_neg).sum(dim=1) / exp_x_neg.sum(dim=1)
-                )
-
-                y_max = net_pin_y.max(dim=1, keepdim=True).values
-                y_min = net_pin_y.min(dim=1, keepdim=True).values
-                exp_y_pos = torch.exp((net_pin_y - y_max) * inv_gamma)
-                exp_y_neg = torch.exp((y_min - net_pin_y) * inv_gamma)
-                wl_y = (
-                    (net_pin_y * exp_y_pos).sum(dim=1) / exp_y_pos.sum(dim=1)
-                    - (net_pin_y * exp_y_neg).sum(dim=1) / exp_y_neg.sum(dim=1)
-                )
-
-                total_wl = total_wl + (wl_x + wl_y).sum()
+                chunk_size = self.wl_bucket_chunk_size
+                if chunk_size <= 0 or pin_indices.shape[0] <= chunk_size:
+                    total_wl = total_wl + self._weighted_average_wirelength_bucket(
+                        pin_x, pin_y, pin_indices, inv_gamma)
+                else:
+                    for start in range(0, pin_indices.shape[0], chunk_size):
+                        end = min(start + chunk_size, pin_indices.shape[0])
+                        total_wl = total_wl + self._weighted_average_wirelength_bucket(
+                            pin_x, pin_y, pin_indices[start:end], inv_gamma)
             return total_wl
         
         for net_id in range(self.num_nets):

@@ -9,6 +9,36 @@ import torch.nn as nn
 import torch.fft as fft
 
 
+_TRANSFORM_CACHE = {}
+_DST_CACHE = {}
+
+
+def _get_transform_cache(num_bins, device, dtype):
+    key = (num_bins, torch.device(device).type, torch.device(device).index, dtype)
+    cached = _TRANSFORM_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    n = torch.arange(num_bins, device=device, dtype=dtype)
+    k = torch.arange(num_bins, device=device, dtype=dtype)
+    dct_matrix = torch.cos(math.pi * k.unsqueeze(1) * (2 * n.unsqueeze(0) + 1) / (2 * num_bins))
+    cached = dct_matrix
+    _TRANSFORM_CACHE[key] = cached
+    return cached
+
+
+def _get_idst_matrix_t(num_bins, device, dtype):
+    key = (num_bins, torch.device(device).type, torch.device(device).index, dtype)
+    cached = _DST_CACHE.get(key)
+    if cached is not None:
+        return cached
+    n = torch.arange(num_bins, device=device, dtype=dtype)
+    k = torch.arange(num_bins, device=device, dtype=dtype)
+    cached = torch.sin(math.pi * k.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * num_bins)).T
+    _DST_CACHE[key] = cached
+    return cached
+
+
 class ElectricPotential1D(nn.Module):
     """
     @brief 1D Electric Potential for Pin Assign
@@ -16,7 +46,8 @@ class ElectricPotential1D(nn.Module):
     and avoid overlaps. Based on ePlace methodology adapted for 1D.
     """
     def __init__(self, pin_widths, edge_length, edge_start, num_bins, 
-                 target_density, device, dtype=torch.float32):
+                 target_density, device, dtype=torch.float32,
+                 density_chunk_size: int = 8192):
         """
         @param pin_widths tensor of pin widths (num_pins,)
         @param edge_length length of the edge
@@ -35,6 +66,7 @@ class ElectricPotential1D(nn.Module):
         self.target_density = target_density
         self.device = device
         self.dtype = dtype
+        self.density_chunk_size = int(density_chunk_size) if density_chunk_size else 0
         
         # Bin size
         self.bin_size = edge_length / num_bins
@@ -60,20 +92,7 @@ class ElectricPotential1D(nn.Module):
         self.register_buffer('w2', w2)
         self.register_buffer('inv_w2', 1.0 / w2)
 
-        n = torch.arange(num_bins, device=device, dtype=dtype)
-        kk = torch.arange(num_bins, device=device, dtype=dtype)
-        self.register_buffer(
-            'dct_matrix',
-            torch.cos(math.pi * kk.unsqueeze(1) * (2 * n.unsqueeze(0) + 1) / (2 * num_bins))
-        )
-        self.register_buffer(
-            'idct_matrix_t',
-            torch.cos(math.pi * kk.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * num_bins)).T
-        )
-        self.register_buffer(
-            'idst_matrix_t',
-            torch.sin(math.pi * kk.unsqueeze(0) * (2 * n.unsqueeze(1) + 1) / (2 * num_bins)).T
-        )
+        self.dct_matrix = _get_transform_cache(num_bins, device, dtype)
         
         # Target density per bin
         total_pin_width = pin_widths.sum().item()
@@ -141,27 +160,23 @@ class ElectricPotential1D(nn.Module):
         
         Uses smooth Gaussian-like spreading for differentiability.
         """
-        # Compute distances from each pin to each bin center
-        # pos: (num_pins,), bin_centers: (num_bins,)
-        # distances: (num_pins, num_bins)
-        distances = pos.unsqueeze(1) - self.bin_centers.unsqueeze(0)
-        
-        # Use smooth bell-shaped distribution
-        # sigma = pin_width / 2 (approximate width as sigma)
-        # But for simplicity, use a fixed sigma based on bin_size
-        sigma = self.bin_size * 1.5  # Smoothing parameter
-        
-        # Gaussian kernel (normalized)
-        weights = torch.exp(-0.5 * (distances / sigma) ** 2)
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-10)  # Normalize per pin
-        
-        # Weight by pin width
-        pin_contributions = self.pin_widths.unsqueeze(1) * weights
-        
-        # Sum contributions from all pins
-        density_map = pin_contributions.sum(dim=0)
-        
+        chunk_size = self.density_chunk_size
+        if chunk_size <= 0 or self.num_pins <= chunk_size:
+            return self._compute_density_map_chunk(pos, self.pin_widths)
+
+        density_map = torch.zeros(self.num_bins, device=self.device, dtype=self.dtype)
+        for start in range(0, self.num_pins, chunk_size):
+            end = min(start + chunk_size, self.num_pins)
+            density_map = density_map + self._compute_density_map_chunk(
+                pos[start:end], self.pin_widths[start:end])
         return density_map
+
+    def _compute_density_map_chunk(self, pos, pin_widths):
+        distances = pos.unsqueeze(1) - self.bin_centers.unsqueeze(0)
+        sigma = self.bin_size * 1.5  # Smoothing parameter
+        weights = torch.exp(-0.5 * (distances / sigma) ** 2)
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-10)
+        return (pin_widths.unsqueeze(1) * weights).sum(dim=0)
     
     def solve_poisson_1d(self, density_map):
         """
@@ -228,7 +243,7 @@ class ElectricPotential1D(nn.Module):
         """
         N = X.shape[0]
         if N == self.num_bins:
-            result = torch.mv(self.idct_matrix_t, X)
+            result = torch.mv(self.dct_matrix, X)
         else:
             n = torch.arange(N, device=X.device, dtype=X.dtype)
             k = torch.arange(N, device=X.device, dtype=X.dtype)
@@ -246,7 +261,7 @@ class ElectricPotential1D(nn.Module):
         """
         N = X.shape[0]
         if N == self.num_bins:
-            result = torch.mv(self.idst_matrix_t, X)
+            result = torch.mv(_get_idst_matrix_t(self.num_bins, X.device, X.dtype), X)
         else:
             n = torch.arange(N, device=X.device, dtype=X.dtype)
             k = torch.arange(N, device=X.device, dtype=X.dtype)
@@ -550,6 +565,7 @@ class EdgePlace(nn.Module):
         # Get parameters
         num_bins = getattr(params, 'num_bins', 64)
         target_density = getattr(params, 'target_density', 0.8)
+        density_chunk_size = getattr(params, 'density_pin_chunk_size', 8192)
         
         # Get pin widths
         pin_widths = torch.tensor(edge.pin_widths, dtype=torch.float32, device=device)
@@ -561,7 +577,8 @@ class EdgePlace(nn.Module):
             edge_start=edge.start_point,
             num_bins=num_bins,
             target_density=target_density,
-            device=device
+            device=device,
+            density_chunk_size=density_chunk_size,
         )
         
         # Store for later use
