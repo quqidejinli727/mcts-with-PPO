@@ -690,6 +690,152 @@ def build_net_data_structures(nets, num_pins, device):
     return flat_net2pin_map, flat_net2pin_start_map, pin2net_map, net_weights, net_mask
 
 
+def _direction_from_segment_field(direction_value) -> Optional[str]:
+    """Decode the optional direction field from segment_assignments."""
+    if isinstance(direction_value, str):
+        value = direction_value.strip().lower()
+        if value in ("horizontal", "h", "0"):
+            return "horizontal"
+        if value in ("vertical", "v", "1"):
+            return "vertical"
+        return None
+    try:
+        return "horizontal" if int(direction_value) == 0 else "vertical"
+    except (TypeError, ValueError):
+        return None
+
+
+def _infer_segment_geometry(coords, direction_value=None):
+    """
+    Infer edge orientation from segment endpoints first, falling back to the
+    direction field only when coordinates are degenerate/ambiguous.
+    """
+    x1, y1, x2, y2 = (float(coords[0]), float(coords[1]),
+                       float(coords[2]), float(coords[3]))
+    eps = 1e-6
+    dx = abs(x2 - x1)
+    dy = abs(y2 - y1)
+
+    if dy <= eps and dx > eps:
+        direction = "horizontal"
+    elif dx <= eps and dy > eps:
+        direction = "vertical"
+    else:
+        direction = _direction_from_segment_field(direction_value) or "horizontal"
+
+    if direction == "horizontal":
+        return direction, y1, min(x1, x2), max(x1, x2)
+    return direction, x1, min(y1, y2), max(y1, y2)
+
+
+def _edge_pin_bounds(edge: "Edge", local_idx: int) -> Tuple[float, float]:
+    """Return legal center-coordinate bounds for one pin on an edge."""
+    width = 0.0
+    if 0 <= local_idx < len(edge.pin_widths):
+        width = float(edge.pin_widths[local_idx])
+    lower = float(edge.start_point) + width / 2.0
+    upper = float(edge.end_point) - width / 2.0
+    if lower <= upper:
+        return lower, upper
+    center = (float(edge.start_point) + float(edge.end_point)) / 2.0
+    return center, center
+
+
+def _clamp_edge_coord(coord: float, edge: "Edge", local_idx: int) -> float:
+    lower, upper = _edge_pin_bounds(edge, local_idx)
+    return min(max(float(coord), lower), upper)
+
+
+def validate_reuse_edge_groups(
+    edges: List["Edge"],
+    reuse_group: List[List[int]],
+    length_tol: float = 1e-6,
+    width_tol: float = 1e-6,
+) -> None:
+    """
+    Validate Stage2 reuse assumptions.
+
+    A reuse edge in Stage2 is treated as a strict translation of the base edge:
+    same direction, same length, same pin count, and same pin-width multiset.
+    Stage2 does not repair mismatched reuse geometry; invalid input should fail
+    fast because otherwise the translated reuse positions can leave the segment.
+    """
+    errors: List[str] = []
+
+    for group_idx, grp in enumerate(reuse_group):
+        if len(grp) < 2:
+            continue
+        base_id = grp[0]
+        base_edge = edges[base_id]
+        base_widths = [float(w) for w in base_edge.pin_widths]
+        base_widths_sorted = sorted(base_widths)
+        for reuse_id in grp[1:]:
+            reuse_edge = edges[reuse_id]
+            reuse_widths = [float(w) for w in reuse_edge.pin_widths]
+            reuse_widths_sorted = sorted(reuse_widths)
+            problems: List[str] = []
+
+            if base_edge.direction != reuse_edge.direction:
+                problems.append(
+                    "direction %s != %s" % (reuse_edge.direction, base_edge.direction))
+
+            base_len = float(base_edge.length)
+            reuse_len = float(reuse_edge.length)
+            if abs(base_len - reuse_len) > length_tol:
+                problems.append(
+                    "length %.6f != %.6f" % (reuse_len, base_len))
+
+            if len(reuse_widths) != len(base_widths):
+                problems.append(
+                    "pin_count %d != %d" % (len(reuse_widths), len(base_widths)))
+            else:
+                width_mismatches = [
+                    (idx, base_w, reuse_w)
+                    for idx, (base_w, reuse_w) in enumerate(zip(base_widths_sorted, reuse_widths_sorted))
+                    if abs(base_w - reuse_w) > width_tol
+                ]
+                if width_mismatches:
+                    problems.append(
+                        "pin_width_multiset mismatch examples=%s"
+                        % (width_mismatches[:5],))
+
+            if problems:
+                errors.append(
+                    "group=%d base_edge=%d reuse_edge=%d base=[dir=%s,len=%.6f,pins=%d,start=%.6f,end=%.6f] "
+                    "reuse=[dir=%s,len=%.6f,pins=%d,start=%.6f,end=%.6f] problems=%s"
+                    % (
+                        group_idx,
+                        base_id,
+                        reuse_id,
+                        base_edge.direction,
+                        base_len,
+                        len(base_widths),
+                        float(base_edge.start_point),
+                        float(base_edge.end_point),
+                        reuse_edge.direction,
+                        reuse_len,
+                        len(reuse_widths),
+                        float(reuse_edge.start_point),
+                        float(reuse_edge.end_point),
+                        "; ".join(problems),
+                    )
+                )
+
+    if errors:
+        msg = (
+            "Invalid Stage2 reuse edge group(s): %d mismatch(es). "
+            "Stage2 reuse requires strict translated copies with identical length, "
+            "direction, pin count, and pin-width multiset. This should be fixed in "
+            "Stage1 segment assignment/export.\n%s%s"
+            % (
+                len(errors),
+                "\n".join(errors[:20]),
+                "\n..." if len(errors) > 20 else "",
+            )
+        )
+        raise ValueError(msg)
+
+
 
 # ---------------------------------------------------------------------------
 # test_wirelength_optimization / test_electric_potential_optimization /
@@ -786,20 +932,8 @@ def build_edge_places_from_segment_assignments(
 
     for master_seg_id, _blk_id, inst in inst_records:
         coords = inst["coordinates"]  # [x1, y1, x2, y2]
-        x1, y1, x2, y2 = (float(coords[0]), float(coords[1]),
-                           float(coords[2]), float(coords[3]))
-        direction_int = inst.get("direction", inst.get("direction", 0))
-
-        if direction_int == 0:
-            direction = "horizontal"
-            fixed_val = y1
-            start_val = min(x1, x2)
-            end_val   = max(x1, x2)
-        else:
-            direction = "vertical"
-            fixed_val = x1
-            start_val = min(y1, y2)
-            end_val   = max(y1, y2)
+        direction, fixed_val, start_val, end_val = _infer_segment_geometry(
+            coords, inst.get("direction", None))
 
         # Collect pins on this inst, sorted by pin id for stable ordering
         # Placeholder pins (id == -1) have no 'width'; keep them for pin-count
@@ -888,6 +1022,8 @@ def write_pin_positions_by_name(
         pingroup_data = json.load(f)
 
     unassigned: List[str] = []
+    out_of_bounds = 0
+    out_of_bounds_examples: List[Tuple[str, int, int, float, float]] = []
     total = 0
     for net_pins in pingroup_data:
         for pin_data in net_pins:
@@ -898,6 +1034,14 @@ def write_pin_positions_by_name(
                 edge = edges[edge_id]
                 pos_1d = edge_places[edge_id].pos[0].detach().cpu().numpy()
                 coord = float(pos_1d[local_idx])
+                coord_legal = _clamp_edge_coord(coord, edge, local_idx)
+                clamp_delta = abs(coord_legal - coord)
+                significant_tol = max(1e-4, abs(coord) * 5e-7)
+                if clamp_delta > significant_tol:
+                    out_of_bounds += 1
+                    if len(out_of_bounds_examples) < 10:
+                        out_of_bounds_examples.append(
+                            (pname, edge_id, local_idx, coord, coord_legal))
                 if edge.direction == "horizontal":
                     x, y = coord, float(edge.fixed_val)
                 else:
@@ -914,12 +1058,20 @@ def write_pin_positions_by_name(
             str(unassigned[:20]),
             " ..." if len(unassigned) > 20 else "",
         )
+    if out_of_bounds:
+        logging.warning(
+            "write_pin_positions_by_name: %d pin coordinate(s) are outside their assigned segment; "
+            "result is written unchanged. examples=%s%s",
+            out_of_bounds,
+            out_of_bounds_examples,
+            " ..." if out_of_bounds > len(out_of_bounds_examples) else "",
+        )
 
     os.makedirs(os.path.dirname(os.path.abspath(result_path)), exist_ok=True)
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(pingroup_data, f, indent=4, ensure_ascii=False)
-    logging.info("Pin positions written to %s  (%d pins total, %d unassigned)",
-                 result_path, total, len(unassigned))
+    logging.info("Pin positions written to %s  (%d pins total, %d unassigned, %d out_of_bounds)",
+                 result_path, total, len(unassigned), out_of_bounds)
 
 
 def test_optimization_from_segment_assignments(
@@ -984,6 +1136,8 @@ def test_optimization_from_segment_assignments(
         reuse_edge_ids = {rid for grp in reuse_group for rid in grp[1:]}
     else:
         reuse_edge_ids = set()
+
+    validate_reuse_edge_groups(edges, reuse_group)
 
     # Total optimisation pin count
     num_pins = sum(len(e.pin_widths) for e in edges)
@@ -1067,8 +1221,14 @@ def test_optimization_from_segment_assignments(
     )
 
     # ------------------------------------------------------------------
-    # 8. Sync helper for reuse edges
+    # 8. Boundary / sync helpers
     # ------------------------------------------------------------------
+    def clamp_base_positions():
+        with torch.no_grad():
+            for eid, ep in enumerate(edge_places):
+                if eid not in reuse_edge_ids:
+                    ep.op_collections.move_boundary_op(ep.pos[0])
+
     def sync_reuse_positions():
         if not reuse_group:
             return
@@ -1079,7 +1239,8 @@ def test_optimization_from_segment_assignments(
                 for rid in grp[1:]:
                     offset = edge_places[rid].start_point - base_start
                     edge_places[rid].pos[0].data.copy_(
-                        edge_places[base_id].pos[0].data + offset)
+                        edge_places[base_id].pos[0].data + offset
+                    )
 
     # ------------------------------------------------------------------
     # 9. Optimization loop
@@ -1093,10 +1254,8 @@ def test_optimization_from_segment_assignments(
     for iteration in range(max_iterations):
         t_iter_start = time.time()
 
-        # Boundary clamp (skip reuse edges)
-        for eid, ep in enumerate(edge_places):
-            if eid not in reuse_edge_ids:
-                ep.op_collections.move_boundary_op(ep.pos[0])
+        # Boundary clamp (reuse positions are derived from base positions)
+        clamp_base_positions()
 
         optimizer.zero_grad()
 
@@ -1121,7 +1280,8 @@ def test_optimization_from_segment_assignments(
         objective.backward()
         optimizer.step()
 
-        # Keep reuse edges in sync
+        # Keep all exported/evaluated positions legal immediately after Adam updates.
+        clamp_base_positions()
         sync_reuse_positions()
 
         # Per-edge density weight adaptation
@@ -1174,6 +1334,8 @@ def test_optimization_from_segment_assignments(
     # ------------------------------------------------------------------
     # 10. Final metrics
     # ------------------------------------------------------------------
+    clamp_base_positions()
+    sync_reuse_positions()
     all_edge_positions = {eid: ep.pos[0] for eid, ep in enumerate(edge_places)}
     with torch.no_grad():
         final_wl      = place_obj.obj_wl_test(all_edge_positions).item()

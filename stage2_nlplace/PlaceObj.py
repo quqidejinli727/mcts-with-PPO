@@ -199,7 +199,9 @@ class PlaceObj(nn.Module):
                 base_edge = edges[base_id]
                 for reuse_id in group[1:]:
                     reuse_edge = edges[reuse_id]
-                    # Offset along the varying direction of the edge
+                    # Offset along the varying direction of the edge.  This is
+                    # valid only when reuse instances are geometrically identical
+                    # translations of the base instance.
                     offset = float(reuse_edge.start_point - base_edge.start_point)
                     self.base_edge_of[reuse_id] = base_id
                     self.reuse_offset[reuse_id] = offset
@@ -413,7 +415,10 @@ class PlaceObj(nn.Module):
             edge = edge_place.edge
             
             if edge_id in self.is_reuse_edge:
-                # Reuse edge: derive positions from the base edge + offset
+                # Reuse edge: derive positions from the base edge + offset.
+                # Stage 2 assumes reuse instances are strict translations of
+                # the same edge geometry; mismatched geometry is a Stage 1
+                # assignment/export bug and is not rescaled here.
                 base_id = self.base_edge_of[edge_id]
                 offset  = self.reuse_offset[edge_id]
                 # base_pos has requires_grad=True; adding a constant keeps the grad_fn

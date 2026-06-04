@@ -510,10 +510,17 @@ class EdgePlace(nn.Module):
         def move_boundary_op(pos):
             with torch.no_grad():
                 # Clip positions to edge boundaries considering pin widths
-                half_widths = data_collections.pin_widths / 2.0
+                half_widths = data_collections.pin_widths.to(
+                    device=pos.device,
+                    dtype=pos.dtype,
+                ) / 2.0
                 pos_min = edge.start_point + half_widths
                 pos_max = edge.end_point - half_widths
-                pos.data.clamp_(min=pos_min, max=pos_max)
+                center = torch.full_like(pos_min, (edge.start_point + edge.end_point) / 2.0)
+                valid_bounds = pos_min <= pos_max
+                lower = torch.where(valid_bounds, pos_min, center)
+                upper = torch.where(valid_bounds, pos_max, center)
+                pos.data.copy_(torch.maximum(torch.minimum(pos.data, upper), lower))
             return pos
         return move_boundary_op
     
