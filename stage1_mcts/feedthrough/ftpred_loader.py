@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import struct
-from typing import Optional, Union
+from typing import Optional
 
 from PlaceDB import PlaceDB
 
@@ -61,7 +61,7 @@ def _pin_coord(pin):
     return (float(getattr(pin, "x")), float(getattr(pin, "y")))
 
 
-def _find_parent_nonleaf_inst(db: PlaceDB, leaf_inst: str) -> Optional[str]:
+def _find_parent_nonleaf_inst(db: PlaceDB, leaf_inst: str) -> str | None:
     """
     给出一个叶模块，向上找出其最近的非叶模块。
     找不到则返回 None。
@@ -255,7 +255,7 @@ def run_ftpred_for_one_net(
     net,
     ftpred_path: str,
     *,
-    Modules: Optional[str] = None,
+    Modules: str | None = None,
     split_nonleaf_nets: bool = True,
 ) -> float:
     """只跑一个 net，并把聚合后的 feedthrough 回写到该 net 对象的 feedthrough 属性。"""

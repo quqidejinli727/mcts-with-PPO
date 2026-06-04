@@ -1,1 +1,1 @@
-"""Feedthrough prediction module (C++ ftpred wrapper)."""
+"""Feedthrough predictor sources and Python loader."""

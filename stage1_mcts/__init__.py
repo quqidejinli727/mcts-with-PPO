@@ -1,21 +1,41 @@
-"""
-Stage 1: MCTS-based segment assignment.
+"""Stage 1: MCTS segment assignment.
 
-Determines which segment each pin should be placed on.
+Provides the ``run_mcts`` entry point used by the top-level PinAssignFlow
+``run.py`` script.
 """
 
-import sys
-import os
-import time
+from __future__ import annotations
+
+import json
 import logging
+import os
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Add this directory to sys.path so internal imports in the MCTS code work
 _STAGE_DIR = os.path.dirname(os.path.abspath(__file__))
-if _STAGE_DIR not in sys.path:
-    sys.path.insert(0, _STAGE_DIR)
+if _STAGE_DIR in sys.path:
+    sys.path.remove(_STAGE_DIR)
+sys.path.insert(0, _STAGE_DIR)
+
+# Stage packages may contain modules with overlapping names. Clear Stage 1
+# modules so this package always reloads them from this directory.
+_STAGE1_MODULES = [
+    "PlaceDB",
+    "assignment_solver",
+    "config",
+    "export_final_result",
+    "geometry_utils",
+    "homology",
+    "mcts",
+    "scoring",
+    "segment",
+    "segment_subdivision",
+]
+for _mod in _STAGE1_MODULES:
+    sys.modules.pop(_mod, None)
 
 
 def run_mcts(
@@ -23,73 +43,105 @@ def run_mcts(
     pingroup_json: str,
     output_dir: str,
     num_simulations: int = 1000,
-    time_limit: float = 30.0,
+    time_limit: float | None = None,
 ) -> str:
-    """Run MCTS segment assignment pipeline.
+    """Run MCTS segment assignment.
 
     Args:
-        block_json: Path to block.json.
-        pingroup_json: Path to pingroup.json.
-        output_dir: Directory where segment_assignments.json will be written.
-        num_simulations: Number of MCTS simulations per processing unit.
-        time_limit: Time limit in seconds per processing unit.
+        block_json: Path to block.json from the benchmark case.
+        pingroup_json: Path to pingroup.json from the benchmark case.
+        output_dir: Directory for Stage 1 outputs.
+        num_simulations: MCTS base simulation count.
+        time_limit: Accepted for run.py compatibility; the current solver uses
+            simulation count rather than a wall-clock limit.
 
     Returns:
-        Path to the generated segment_assignments.json file.
+        Path to the generated ``segment_assignments_*.json`` file.
     """
-    from complete_mcts_pipeline import CompleteMCTSPipeline
-    from segment_usages_direct_interface import create_segment_usages_direct_interface
+    from assignment_solver import AssignmentSolver
+    from config import DEFAULT_CONFIG
+    from export_final_result import write_interface_result
+    from scoring import summarize_metrics
 
-    block_json = str(Path(block_json).resolve())
-    pingroup_json = str(Path(pingroup_json).resolve())
-    output_dir = str(Path(output_dir).resolve())
-    os.makedirs(output_dir, exist_ok=True)
+    output_path = Path(output_dir).resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+    if time_limit is not None:
+        logger.info(
+            "Stage 1 time_limit=%.1fs accepted for compatibility; "
+            "current MCTS uses num_simulations.",
+            time_limit,
+        )
 
-    if not Path(block_json).exists():
-        raise FileNotFoundError(f"Block file not found: {block_json}")
-    if not Path(pingroup_json).exists():
-        raise FileNotFoundError(f"Pingroup file not found: {pingroup_json}")
-
-    logger.info("=" * 70)
-    logger.info("Stage 1: MCTS Segment Assignment")
-    logger.info("=" * 70)
-    logger.info(f"  block_json: {block_json}")
-    logger.info(f"  pingroup_json: {pingroup_json}")
-    logger.info(f"  num_simulations: {num_simulations}")
-    logger.info(f"  time_limit: {time_limit}")
-
-    pipeline = CompleteMCTSPipeline()
-    pipeline.block_file = block_json
-    pipeline.pingroup_file = pingroup_json
-
-    success = pipeline.run_complete_mcts_pipeline(
-        block_json, pingroup_json, num_simulations, time_limit
+    config = replace(
+        DEFAULT_CONFIG,
+        block_json_path=Path(block_json).resolve(),
+        pingroup_json_path=Path(pingroup_json).resolve(),
+        assignment_output_path=output_path / "stage1_assignment.json",
+        results_root=output_path / "stage1_run_results",
+        interface_result_dir=output_path,
+        simulations=num_simulations,
     )
-
-    if not success:
-        raise RuntimeError("MCTS pipeline failed.")
-
-    # Save detailed results
-    detailed_dir = os.path.join(output_dir, "mcts_detailed")
-    os.makedirs(detailed_dir, exist_ok=True)
-    timestamp = int(time.time())
-    detailed_output_file = os.path.join(
-        detailed_dir, f"mcts_assignment_results_{timestamp}.json"
+    solver = AssignmentSolver(
+        block_json_path=str(config.block_json_path),
+        pingroup_json_path=str(config.pingroup_json_path),
+        simulations=config.simulations,
+        random_seed=config.random_seed,
+        allow_overflow_fallback=config.allow_overflow_fallback,
+        enable_segment_subdivision=config.enable_segment_subdivision,
+        segment_length_percentile=config.segment_length_percentile,
+        mcts_search_mode=config.mcts_search_mode,
+        mcts_budget_decay=config.mcts_budget_decay,
+        mcts_tail_decay=config.mcts_tail_decay,
+        mcts_typical_depth=config.mcts_typical_depth,
+        mcts_space_scale_divisor=config.mcts_space_scale_divisor,
+        mcts_max_space_factor=config.mcts_max_space_factor,
+        mcts_min_layer_simulations=config.mcts_min_layer_simulations,
+        mcts_tail_depth=config.mcts_tail_depth,
+        mcts_early_stop_std_multiplier=config.mcts_early_stop_std_multiplier,
+        mcts_enable_tail_early_stop=config.mcts_enable_tail_early_stop,
+        mcts_basic_dynamic_simulations=config.mcts_basic_dynamic_simulations,
+        mcts_basic_space_scale_divisor=config.mcts_basic_space_scale_divisor,
+        mcts_basic_max_space_factor=config.mcts_basic_max_space_factor,
+        mcts_basic_min_simulations=config.mcts_basic_min_simulations,
+        wirelength_reward_weight=config.wirelength_reward_weight,
+        feedthrough_weight=config.feedthrough_weight,
+        reward_normalization_floor=config.reward_normalization_floor,
+        reward_scale=config.reward_scale,
+        feedthrough_source_dir=config.feedthrough_source_dir,
+        enable_feedthrough=config.enable_feedthrough,
+        auto_build_feedthrough=config.auto_build_feedthrough,
+        cmake_generator=config.cmake_generator if os.name == "nt" else None,
     )
-    pipeline.save_results(detailed_output_file)
-    logger.info(f"Detailed MCTS results saved to: {detailed_output_file}")
-
-    # Convert to segment_assignments format
-    interface = create_segment_usages_direct_interface(pipeline.floorplan)
-    segment_usages = interface.load_mcts_segment_usages(detailed_output_file)
-
-    if not segment_usages:
-        raise RuntimeError("Failed to load segment_usages from MCTS results.")
-
-    final_result = interface.convert_from_mcts_segment_usages(segment_usages)
-
-    output_file = os.path.join(output_dir, "segment_assignments.json")
-    interface.export_segment_assignments(final_result, output_file)
-    logger.info(f"Segment assignments written to: {output_file}")
-
-    return output_file
+    try:
+        assignment_result = solver.solve()
+        config.assignment_output_path.write_text(
+            json.dumps(assignment_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        metrics = solver.final_net_metrics(
+            feedthrough_source_dir=config.feedthrough_source_dir,
+            enable_feedthrough=config.enable_feedthrough,
+            auto_build_feedthrough=config.auto_build_feedthrough,
+            cmake_generator=config.cmake_generator if os.name == "nt" else None,
+        )
+        summary = summarize_metrics(metrics)
+        print(
+            "Stage 1 metrics: "
+            f"total_hpwl={summary['total_hpwl']:.6f}, "
+            f"total_feedthrough={summary['total_feedthrough']:.6f}"
+        )
+        logger.info(
+            "Stage 1 metrics: total_hpwl=%.6f, total_feedthrough=%.6f",
+            summary["total_hpwl"],
+            summary["total_feedthrough"],
+        )
+        return str(
+            write_interface_result(
+                output_path,
+                solver.placedb,
+                solver.homology,
+                solver.segment_manager,
+            )
+        )
+    finally:
+        solver.close_feedthrough_context()

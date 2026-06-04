@@ -35,6 +35,7 @@ PROJECT(flute)
 SET(CMAKE_CXX_STANDARD 11)
 
 SET(FLUTE_HOME ${PROJECT_SOURCE_DIR})
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(POWV9_DAT ${FLUTE_HOME}/etc/POWV9.dat)
 set(POST9_DAT ${FLUTE_HOME}/etc/POST9.dat)
@@ -42,13 +43,13 @@ set(POWV9_CPP ${CMAKE_CURRENT_BINARY_DIR}/POWV9.cpp)
 set(POST9_CPP ${CMAKE_CURRENT_BINARY_DIR}/POST9.cpp)
 
 add_custom_command(OUTPUT ${POWV9_CPP}
-  COMMAND ${FLUTE_HOME}/etc/MakeDatVar.tcl powv9 ${POWV9_CPP} ${POWV9_DAT}
-  DEPENDS ${POWV9_DAT} ${FLUTE_HOME}/etc/MakeDatVar.tcl
+  COMMAND ${Python3_EXECUTABLE} ${FLUTE_HOME}/etc/make_dat_var.py powv9 ${POWV9_CPP} ${POWV9_DAT}
+  DEPENDS ${POWV9_DAT} ${FLUTE_HOME}/etc/make_dat_var.py
   )
 
 add_custom_command(OUTPUT ${POST9_CPP}
-  COMMAND ${FLUTE_HOME}/etc/MakeDatVar.tcl post9 ${POST9_CPP} ${POST9_DAT}
-  DEPENDS ${POST9_DAT} ${FLUTE_HOME}/etc/MakeDatVar.tcl
+  COMMAND ${Python3_EXECUTABLE} ${FLUTE_HOME}/etc/make_dat_var.py post9 ${POST9_CPP} ${POST9_DAT}
+  DEPENDS ${POST9_DAT} ${FLUTE_HOME}/etc/make_dat_var.py
   )
 
 ADD_LIBRARY(flute
