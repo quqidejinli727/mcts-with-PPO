@@ -10,6 +10,7 @@ import time
 import json
 import numpy as np
 import logging
+import re
 import torch
 import torch.nn as nn
 from typing import List, Dict, Tuple, Optional
@@ -746,19 +747,42 @@ def _clamp_edge_coord(coord: float, edge: "Edge", local_idx: int) -> float:
     return min(max(float(coord), lower), upper)
 
 
+def _strip_reuse_suffix(name: str) -> str:
+    """Remove numeric instance-copy suffixes such as U_F_1 -> U_F."""
+    return re.sub(r"_[0-9]+$", "", name)
+
+
+def canonical_parent_inst(parent_inst: str) -> str:
+    """Normalize each hierarchy component of an instance path for reuse matching."""
+    return ".".join(_strip_reuse_suffix(part) for part in parent_inst.split("."))
+
+
+def canonical_pin_key(pin_name: str) -> str:
+    """
+    Return the reuse key for a full pin name: canonical_parent_inst + pingroup_name.
+
+    Segment assignments store names as "parent_inst.pingroup_name".  In the
+    benchmark pingroup files, reuse copies differ by numeric suffixes on
+    hierarchy components while the logical pingroup_name stays stable.
+    """
+    if "." not in pin_name:
+        return pin_name
+    parent_inst, pingroup_name = pin_name.rsplit(".", 1)
+    return "%s.%s" % (canonical_parent_inst(parent_inst), pingroup_name)
+
+
 def validate_reuse_edge_groups(
     edges: List["Edge"],
     reuse_group: List[List[int]],
+    reuse_pin_map: Optional[Dict[int, Dict[int, Tuple[int, int, float, float]]]] = None,
     length_tol: float = 1e-6,
-    width_tol: float = 1e-6,
 ) -> None:
     """
     Validate Stage2 reuse assumptions.
 
-    A reuse edge in Stage2 is treated as a strict translation of the base edge:
-    same direction, same length, same pin count, and same pin-width multiset.
-    Stage2 does not repair mismatched reuse geometry; invalid input should fail
-    fast because otherwise the translated reuse positions can leave the segment.
+    Only segment length equality is a hard check. Pin counts, direction, and
+    pin widths are intentionally not hard-checked here; pin-level reuse handles
+    shared pins while edge-local pins remain independent.
     """
     errors: List[str] = []
 
@@ -767,37 +791,14 @@ def validate_reuse_edge_groups(
             continue
         base_id = grp[0]
         base_edge = edges[base_id]
-        base_widths = [float(w) for w in base_edge.pin_widths]
-        base_widths_sorted = sorted(base_widths)
         for reuse_id in grp[1:]:
             reuse_edge = edges[reuse_id]
-            reuse_widths = [float(w) for w in reuse_edge.pin_widths]
-            reuse_widths_sorted = sorted(reuse_widths)
             problems: List[str] = []
-
-            if base_edge.direction != reuse_edge.direction:
-                problems.append(
-                    "direction %s != %s" % (reuse_edge.direction, base_edge.direction))
 
             base_len = float(base_edge.length)
             reuse_len = float(reuse_edge.length)
             if abs(base_len - reuse_len) > length_tol:
-                problems.append(
-                    "length %.6f != %.6f" % (reuse_len, base_len))
-
-            if len(reuse_widths) != len(base_widths):
-                problems.append(
-                    "pin_count %d != %d" % (len(reuse_widths), len(base_widths)))
-            else:
-                width_mismatches = [
-                    (idx, base_w, reuse_w)
-                    for idx, (base_w, reuse_w) in enumerate(zip(base_widths_sorted, reuse_widths_sorted))
-                    if abs(base_w - reuse_w) > width_tol
-                ]
-                if width_mismatches:
-                    problems.append(
-                        "pin_width_multiset mismatch examples=%s"
-                        % (width_mismatches[:5],))
+                problems.append("length %.6f != %.6f" % (reuse_len, base_len))
 
             if problems:
                 errors.append(
@@ -809,12 +810,12 @@ def validate_reuse_edge_groups(
                         reuse_id,
                         base_edge.direction,
                         base_len,
-                        len(base_widths),
+                        len(base_edge.pin_widths),
                         float(base_edge.start_point),
                         float(base_edge.end_point),
                         reuse_edge.direction,
                         reuse_len,
-                        len(reuse_widths),
+                        len(reuse_edge.pin_widths),
                         float(reuse_edge.start_point),
                         float(reuse_edge.end_point),
                         "; ".join(problems),
@@ -824,9 +825,8 @@ def validate_reuse_edge_groups(
     if errors:
         msg = (
             "Invalid Stage2 reuse edge group(s): %d mismatch(es). "
-            "Stage2 reuse requires strict translated copies with identical length, "
-            "direction, pin count, and pin-width multiset. This should be fixed in "
-            "Stage1 segment assignment/export.\n%s%s"
+            "Stage2 reuse hard-checks only segment length equality; all pin-level "
+            "differences are handled by pin-level reuse logic.\n%s%s"
             % (
                 len(errors),
                 "\n".join(errors[:20]),
@@ -834,6 +834,71 @@ def validate_reuse_edge_groups(
             )
         )
         raise ValueError(msg)
+
+
+def build_reuse_pin_map(
+    edges: List["Edge"],
+    reuse_group: List[List[int]],
+) -> Dict[int, Dict[int, Tuple[int, int, float, float]]]:
+    """
+    Build reuse_edge -> reuse_local_idx -> (base_edge, base_local_idx, scale, offset).
+
+    Shared pins are matched by edge.pin_reuse_keys and must exist on every edge
+    in a reuse group.  Pins that exist only on a subset of edges stay independent.
+    The mapped coordinate is affine over each pin's legal center interval:
+        reuse_pos = base_pos * scale + offset
+    Length equality is checked separately before optimization.  The affine form
+    keeps shared pins legal even when their pin widths differ.
+    """
+    reuse_pin_map: Dict[int, Dict[int, Tuple[int, int, float, float]]] = {}
+    shared = 0
+    independent = 0
+
+    for grp in reuse_group:
+        if len(grp) < 2:
+            continue
+        base_id = grp[0]
+        base_edge = edges[base_id]
+        key_to_idx_by_edge = []
+        for edge_id in grp:
+            key_to_idx = {
+                key: idx
+                for idx, key in enumerate(getattr(edges[edge_id], "pin_reuse_keys", []))
+                if key
+            }
+            key_to_idx_by_edge.append(key_to_idx)
+        shared_keys = set(key_to_idx_by_edge[0].keys())
+        for key_to_idx in key_to_idx_by_edge[1:]:
+            shared_keys &= set(key_to_idx.keys())
+
+        for reuse_id in grp[1:]:
+            reuse_edge = edges[reuse_id]
+            edge_map: Dict[int, Tuple[int, int, float, float]] = {}
+            for reuse_idx, key in enumerate(getattr(reuse_edge, "pin_reuse_keys", [])):
+                if key not in shared_keys:
+                    independent += 1
+                    continue
+                base_idx = key_to_idx_by_edge[0][key]
+                base_lower, base_upper = _edge_pin_bounds(base_edge, base_idx)
+                reuse_lower, reuse_upper = _edge_pin_bounds(reuse_edge, reuse_idx)
+                base_span = base_upper - base_lower
+                reuse_span = reuse_upper - reuse_lower
+                if base_span > 1e-12:
+                    scale = reuse_span / base_span
+                    offset = reuse_lower - base_lower * scale
+                else:
+                    scale = 0.0
+                    offset = (reuse_lower + reuse_upper) / 2.0
+                edge_map[reuse_idx] = (base_id, base_idx, scale, offset)
+                shared += 1
+            reuse_pin_map[reuse_id] = edge_map
+
+    logging.info(
+        "Pin-level reuse map: %d shared pin(s), %d independent reuse-edge pin(s)",
+        shared,
+        independent,
+    )
+    return reuse_pin_map
 
 
 
@@ -856,6 +921,7 @@ def build_edge_places_from_segment_assignments(
     List[Edge],
     List["EdgePlace"],
     List[List[int]],
+    Dict[int, Dict[int, Tuple[int, int, float, float]]],
     Dict[int, Tuple[int, int]],
     Dict[str, Tuple[int, int]],
     List[List[int]],
@@ -865,8 +931,9 @@ def build_edge_places_from_segment_assignments(
 
     For each master segment that has N block instances (segment_insts), ONE base
     Edge is created from the first inst, and the remaining N-1 insts become
-    *reuse edges* that share the base edge's pin distribution (with a 1-D
-    translation offset).
+    reuse edges.  Reuse is tracked at pin granularity: pins with matching
+    canonical parent-inst + pingroup name share positions; edge-local pins keep
+    independent positions.
 
     Pin width comes directly from the ``assigned_pins`` entries in the JSON, so
     pingroup.json is NOT needed.
@@ -878,12 +945,15 @@ def build_edge_places_from_segment_assignments(
     @param params                    Params object (forwarded to EdgePlace).
     @param placedb                   PlaceDB object (forwarded to EdgePlace).
 
-    @return (edges, edge_places, reuse_group, pin_id_to_local, pin_name_to_local, nets)
+    @return (edges, edge_places, reuse_group, reuse_pin_map, pin_id_to_local,
+             pin_name_to_local, nets)
         edges             – list of Edge objects (base edges first, then their reuse
                             copies, grouped by master segment).
         edge_places       – parallel list of EdgePlace objects.
         reuse_group       – list of groups [[base_edge_id, reuse_id_1, …], …];
                             empty list if no reuse exists.
+        reuse_pin_map     – dict reuse_edge_id -> reuse local pin index ->
+                            (base_edge_id, base local pin index, scale, offset).
         pin_id_to_local   – dict  pin_id → (edge_id, local_pin_idx).
         pin_name_to_local – dict  "parent_inst.pingroup_name" → (edge_id, local_pin_idx);
                             used by write_pin_positions_by_name for result export.
@@ -942,10 +1012,24 @@ def build_edge_places_from_segment_assignments(
         raw_pins = inst.get("assigned_pins", [])
         sorted_pins = sorted(raw_pins, key=lambda p: p.get("id", -1))
         pin_widths = [float(p.get("width", _MIN_PIN_WIDTH)) for p in sorted_pins]
+        pin_names = [str(p.get("name", "")) for p in sorted_pins]
+        pin_reuse_keys = [canonical_pin_key(name) if name else "" for name in pin_names]
 
         edge_id = len(edges)
         edge = Edge(start_val, end_val, fixed_val, direction, edge_id)
         edge.add_pin_width_list(pin_widths)
+        edge.pin_names = pin_names
+        edge.pin_reuse_keys = pin_reuse_keys
+        edge.pin_meta = [
+            {
+                "id": p.get("id", -1),
+                "name": p.get("name", ""),
+                "reuse_key": key,
+                "net_id": p.get("net_id", -1),
+                "width": float(p.get("width", _MIN_PIN_WIDTH)),
+            }
+            for p, key in zip(sorted_pins, pin_reuse_keys)
+        ]
         edges.append(edge)
         edge_places.append(EdgePlace(params, edge, placedb))
 
@@ -989,13 +1073,14 @@ def build_edge_places_from_segment_assignments(
 
     num_pins = global_pin_offset
     num_reuse = sum(len(g) - 1 for g in reuse_group)
+    reuse_pin_map = build_reuse_pin_map(edges, reuse_group)
     logging.info(
         "build_edge_places_from_segment_assignments: "
         "%d edges (%d base + %d reuse), %d pins, %d nets",
         len(edges), len(edges) - num_reuse, num_reuse,
         num_pins, len(nets),
     )
-    return edges, edge_places, reuse_group, pin_id_to_local, pin_name_to_local, nets
+    return edges, edge_places, reuse_group, reuse_pin_map, pin_id_to_local, pin_name_to_local, nets
 
 
 def write_pin_positions_by_name(
@@ -1042,6 +1127,7 @@ def write_pin_positions_by_name(
                     if len(out_of_bounds_examples) < 10:
                         out_of_bounds_examples.append(
                             (pname, edge_id, local_idx, coord, coord_legal))
+                coord = coord_legal
                 if edge.direction == "horizontal":
                     x, y = coord, float(edge.fixed_val)
                 else:
@@ -1061,7 +1147,7 @@ def write_pin_positions_by_name(
     if out_of_bounds:
         logging.warning(
             "write_pin_positions_by_name: %d pin coordinate(s) are outside their assigned segment; "
-            "result is written unchanged. examples=%s%s",
+            "result was clamped to the legal segment interval. examples=%s%s",
             out_of_bounds,
             out_of_bounds_examples,
             " ..." if out_of_bounds > len(out_of_bounds_examples) else "",
@@ -1072,6 +1158,86 @@ def write_pin_positions_by_name(
         json.dump(pingroup_data, f, indent=4, ensure_ascii=False)
     logging.info("Pin positions written to %s  (%d pins total, %d unassigned, %d out_of_bounds)",
                  result_path, total, len(unassigned), out_of_bounds)
+
+
+def validate_written_pin_positions(
+    result_path: str,
+    edges: List["Edge"],
+    pin_name_to_local: Dict[str, Tuple[int, int]],
+    coord_tol: float = 1e-5,
+) -> None:
+    """Verify written result pins stay on their assigned segment."""
+    with open(result_path, "r", encoding="utf-8") as f:
+        result_data = json.load(f)
+
+    errors: List[Tuple[str, int, int, str]] = []
+    checked = 0
+    for net_pins in result_data:
+        for pin_data in net_pins:
+            pname = pin_data.get("parent_inst", "") + "." + pin_data.get("pingroup_name", "")
+            if pname not in pin_name_to_local:
+                continue
+            scope = pin_data.get("scope")
+            if not isinstance(scope, list) or len(scope) != 2:
+                errors.append((pname, -1, -1, "invalid scope format"))
+                continue
+            edge_id, local_idx = pin_name_to_local[pname]
+            edge = edges[edge_id]
+            x = float(scope[0])
+            y = float(scope[1])
+            lower, upper = _edge_pin_bounds(edge, local_idx)
+            if edge.direction == "horizontal":
+                fixed_delta = abs(y - float(edge.fixed_val))
+                coord = x
+            else:
+                fixed_delta = abs(x - float(edge.fixed_val))
+                coord = y
+            if fixed_delta > coord_tol:
+                errors.append((pname, edge_id, local_idx, "fixed coordinate shifted"))
+                continue
+            if coord < lower - coord_tol or coord > upper + coord_tol:
+                errors.append((pname, edge_id, local_idx, "coordinate outside segment"))
+                continue
+            checked += 1
+
+    if errors:
+        raise ValueError(
+            "Invalid written pin positions: %d error(s), examples=%s%s"
+            % (len(errors), errors[:10], " ..." if len(errors) > 10 else "")
+        )
+    logging.info("Validated written pin positions: %d pins on assigned segments", checked)
+
+
+def validate_reuse_pin_sync(
+    edge_places: List["EdgePlace"],
+    reuse_pin_map: Dict[int, Dict[int, Tuple[int, int, float, float]]],
+    tol: float = 1e-5,
+) -> None:
+    """Verify mapped reuse pins match their base-derived coordinates."""
+    if not reuse_pin_map:
+        return
+
+    errors: List[Tuple[int, int, int, float, float]] = []
+    checked = 0
+    for rid, pin_map in reuse_pin_map.items():
+        reuse_pos = edge_places[rid].pos[0].detach().cpu().numpy()
+        for reuse_idx, (base_id, base_idx, scale, offset) in pin_map.items():
+            base_pos = edge_places[base_id].pos[0].detach().cpu().numpy()
+            expected = float(base_pos[base_idx]) * scale + offset
+            actual = float(reuse_pos[reuse_idx])
+            if abs(actual - expected) > tol:
+                errors.append((rid, reuse_idx, base_id, actual, expected))
+                if len(errors) >= 10:
+                    break
+            checked += 1
+        if len(errors) >= 10:
+            break
+
+    if errors:
+        raise ValueError(
+            "Reuse pin sync validation failed: examples=%s" % (errors,)
+        )
+    logging.info("Validated reuse pin sync: %d mapped pin(s)", checked)
 
 
 def test_optimization_from_segment_assignments(
@@ -1128,7 +1294,7 @@ def test_optimization_from_segment_assignments(
     # ------------------------------------------------------------------
     # 2. Build EdgePlaces, reuse groups, nets
     # ------------------------------------------------------------------
-    edges, edge_places, reuse_group, pin_id_to_local, pin_name_to_local, nets = \
+    edges, edge_places, reuse_group, reuse_pin_map, pin_id_to_local, pin_name_to_local, nets = \
         build_edge_places_from_segment_assignments(
             segment_assignments_path, params, placedb)
 
@@ -1137,7 +1303,7 @@ def test_optimization_from_segment_assignments(
     else:
         reuse_edge_ids = set()
 
-    validate_reuse_edge_groups(edges, reuse_group)
+    validate_reuse_edge_groups(edges, reuse_group, reuse_pin_map)
 
     # Total optimisation pin count
     num_pins = sum(len(e.pin_widths) for e in edges)
@@ -1179,6 +1345,7 @@ def test_optimization_from_segment_assignments(
         net_weights=net_weights,
         net_mask=net_mask,
         reuse_group=reuse_group if reuse_group else None,
+        reuse_pin_map=reuse_pin_map if reuse_pin_map else None,
     ).to(device)
 
     pw = float(getattr(params, "density_weight", 1.0))
@@ -1187,13 +1354,31 @@ def test_optimization_from_segment_assignments(
     place_obj.density_weight.mul_(density_weight_init / pw)
 
     # ------------------------------------------------------------------
-    # 5. Optimizer (skip reuse edges — they share the base edge's params)
+    # 5. Optimizer
+    # Reuse pins present in reuse_pin_map are derived from their base pins in
+    # the objective. Reuse edges with edge-local pins still keep optimizable
+    # parameters for those independent pins.
     # ------------------------------------------------------------------
+    def edge_has_independent_pins(edge_id: int) -> bool:
+        mapped = len(reuse_pin_map.get(edge_id, {}))
+        return mapped < len(edges[edge_id].pin_widths)
+
     all_opt_params: List = []
+    optimized_edge_ids: List[int] = []
+    skipped_reuse_edge_ids: List[int] = []
     for eid, ep in enumerate(edge_places):
-        if eid not in reuse_edge_ids:
-            all_opt_params.extend(ep.parameters())
+        if eid in reuse_edge_ids and not edge_has_independent_pins(eid):
+            skipped_reuse_edge_ids.append(eid)
+            continue
+        all_opt_params.extend(ep.parameters())
+        optimized_edge_ids.append(eid)
+    if not all_opt_params:
+        raise ValueError("No optimizable Stage2 edge parameters were created")
     logging.info("Adam learning_rate=%.6g", adam_learning_rate)
+    logging.info(
+        "Optimized edge parameters: %d/%d edge(s); skipped %d pure mapped reuse edge(s)",
+        len(optimized_edge_ids), len(edge_places), len(skipped_reuse_edge_ids),
+    )
     optimizer = torch.optim.Adam(all_opt_params, lr=adam_learning_rate)
 
     # ------------------------------------------------------------------
@@ -1223,23 +1408,20 @@ def test_optimization_from_segment_assignments(
     # ------------------------------------------------------------------
     # 8. Boundary / sync helpers
     # ------------------------------------------------------------------
-    def clamp_base_positions():
+    def clamp_positions():
         with torch.no_grad():
-            for eid, ep in enumerate(edge_places):
-                if eid not in reuse_edge_ids:
-                    ep.op_collections.move_boundary_op(ep.pos[0])
+            for _eid, ep in enumerate(edge_places):
+                ep.op_collections.move_boundary_op(ep.pos[0])
 
     def sync_reuse_positions():
-        if not reuse_group:
+        if not reuse_pin_map:
             return
         with torch.no_grad():
-            for grp in reuse_group:
-                base_id = grp[0]
-                base_start = edge_places[base_id].start_point
-                for rid in grp[1:]:
-                    offset = edge_places[rid].start_point - base_start
-                    edge_places[rid].pos[0].data.copy_(
-                        edge_places[base_id].pos[0].data + offset
+            for rid, pin_map in reuse_pin_map.items():
+                reuse_pos = edge_places[rid].pos[0].data
+                for reuse_idx, (base_id, base_idx, scale, offset) in pin_map.items():
+                    reuse_pos[reuse_idx] = (
+                        edge_places[base_id].pos[0].data[base_idx] * scale + offset
                     )
 
     # ------------------------------------------------------------------
@@ -1255,9 +1437,12 @@ def test_optimization_from_segment_assignments(
         t_iter_start = time.time()
 
         # Boundary clamp (reuse positions are derived from base positions)
-        clamp_base_positions()
+        clamp_positions()
+        sync_reuse_positions()
 
         optimizer.zero_grad()
+        for ep in edge_places:
+            ep.pos[0].grad = None
 
         all_edge_positions = {eid: ep.pos[0] for eid, ep in enumerate(edge_places)}
         do_pe = (
@@ -1281,7 +1466,7 @@ def test_optimization_from_segment_assignments(
         optimizer.step()
 
         # Keep all exported/evaluated positions legal immediately after Adam updates.
-        clamp_base_positions()
+        clamp_positions()
         sync_reuse_positions()
 
         # Per-edge density weight adaptation
@@ -1334,8 +1519,9 @@ def test_optimization_from_segment_assignments(
     # ------------------------------------------------------------------
     # 10. Final metrics
     # ------------------------------------------------------------------
-    clamp_base_positions()
+    clamp_positions()
     sync_reuse_positions()
+    validate_reuse_pin_sync(edge_places, reuse_pin_map)
     all_edge_positions = {eid: ep.pos[0] for eid, ep in enumerate(edge_places)}
     with torch.no_grad():
         final_wl      = place_obj.obj_wl_test(all_edge_positions).item()
@@ -1364,6 +1550,11 @@ def test_optimization_from_segment_assignments(
             edge_places=edge_places,
             pin_name_to_local=pin_name_to_local,
             result_path=result_json,
+        )
+        validate_written_pin_positions(
+            result_path=result_json,
+            edges=edges,
+            pin_name_to_local=pin_name_to_local,
         )
 
     return place_obj, edge_places, visualizer

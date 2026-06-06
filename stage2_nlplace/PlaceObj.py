@@ -4,7 +4,7 @@ import time
 import numpy as np
 import itertools
 import logging
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.autograd as autograd
@@ -144,7 +144,7 @@ class PlaceObj(nn.Module):
     """
     def __init__(self, density_weight, params, placedb, edges, edge_places, global_place_params=None,
                  flat_net2pin_map=None, flat_net2pin_start_map=None, pin2net_map=None,
-                 net_weights=None, net_mask=None, reuse_group=None) -> None:
+                 net_weights=None, net_mask=None, reuse_group=None, reuse_pin_map=None) -> None:
         """
         @brief initialize ops for placement
         @param density_weight density weight in the objective
@@ -158,9 +158,10 @@ class PlaceObj(nn.Module):
         @param pin2net_map tensor mapping pin to net
         @param net_weights optional tensor of net weights
         @param net_mask optional tensor mask for valid nets
-        @param reuse_group list of reuse groups, e.g. [[0, 2], [1, 3]] means edges 0,2 share
-               the same pin distribution, and edges 1,3 share the same pin distribution.
-               The first element in each group is the base edge.
+        @param reuse_group list of reuse edge groups. The first element in each group is the base edge.
+        @param reuse_pin_map reuse_edge_id -> reuse local pin index ->
+               (base_edge_id, base local pin index, scale, offset).  Only these
+               mapped pins share position; unmapped pins are optimized locally.
         """
         super(PlaceObj, self).__init__()
         
@@ -182,15 +183,11 @@ class PlaceObj(nn.Module):
         self.edge_places = edge_places
         
         # ----------------------------------------------------------------
-        # Build reuse-edge mappings
-        # reuse_group: e.g. [[0, 2]] means edge 0 is the base, edge 2 is a copy
-        # is_reuse_edge : set of edge indices that are non-base copies
-        # base_edge_of  : reuse_edge_id -> base_edge_id
-        # reuse_offset  : reuse_edge_id -> 1-D translation offset (base→reuse)
+        # Build pin-level reuse mappings.
         # ----------------------------------------------------------------
         self.is_reuse_edge = set()
-        self.base_edge_of  = {}   # reuse_id  -> base_id
-        self.reuse_offset  = {}   # reuse_id  -> float offset along edge direction
+        self.base_edge_of  = {}   # reuse_id  -> group base_id, for reporting
+        self.reuse_offset  = {}   # reuse_id  -> edge-level offset, for reporting
         if reuse_group is not None:
             for group in reuse_group:
                 if len(group) < 2:
@@ -199,22 +196,20 @@ class PlaceObj(nn.Module):
                 base_edge = edges[base_id]
                 for reuse_id in group[1:]:
                     reuse_edge = edges[reuse_id]
-                    # Offset along the varying direction of the edge.  This is
-                    # valid only when reuse instances are geometrically identical
-                    # translations of the base instance.
                     offset = float(reuse_edge.start_point - base_edge.start_point)
                     self.base_edge_of[reuse_id] = base_id
                     self.reuse_offset[reuse_id] = offset
                     self.is_reuse_edge.add(reuse_id)
                     logging.info(
-                        "Reuse edge %d is a copy of base edge %d (offset=%.4g)"
-                        % (reuse_id, base_id, offset))
+                        "Reuse edge %d shares mapped pins with base edge %d"
+                        % (reuse_id, base_id))
 
-        # Edges that contribute an independent density term (reuse edges use base density only)
+        self.reuse_pin_map: Dict[int, Dict[int, Tuple[int, int, float, float]]] = reuse_pin_map or {}
+
+        # Every edge contributes density.  Reuse edges may contain independent pins,
+        # so their density cannot be represented by the base edge alone.
         n_ep = len(edge_places) if edge_places is not None else 0
-        self.base_edge_indices: List[int] = [
-            i for i in range(n_ep) if i not in self.is_reuse_edge
-        ]
+        self.base_edge_indices: List[int] = list(range(n_ep))
         self._num_density_edges = len(self.base_edge_indices)
         self.init_density_vec: Optional[torch.Tensor] = None
         
@@ -361,7 +356,7 @@ class PlaceObj(nn.Module):
     def obj_fn(self, all_edge_positions):
         """
         @brief Compute objective.
-            wirelength + sum_i density_weight[i] * density_i (base edges only)
+            wirelength + sum_i density_weight[i] * density_i
         @param all_edge_positions dict mapping edge_id to position tensor for that edge
         @return objective value
         """
@@ -374,7 +369,7 @@ class PlaceObj(nn.Module):
         density_list = []
         for edge_id in self.base_edge_indices:
             edge_place = self.edge_places[edge_id]
-            edge_pos = all_edge_positions[edge_id]
+            edge_pos = self.edge_effective_position(edge_id, all_edge_positions)
             density_list.append(edge_place.op_collections.density_op(edge_pos))
 
         dens_stack = torch.stack(density_list)
@@ -399,12 +394,39 @@ class PlaceObj(nn.Module):
             self.density = (w * dens_stack).sum()
 
         return self.wirelength + self.density_factor * self.density
+
+    def edge_effective_position(self, edge_id, all_edge_positions):
+        """
+        Build the 1-D position tensor used by objectives for one edge.
+
+        For mapped reuse pins, the position is derived from the base pin by an
+        affine mapping over the two pins' legal center intervals.  Unmapped pins
+        keep this edge's own optimization variable.
+        """
+        edge_pos = all_edge_positions[edge_id]
+        pin_map = self.reuse_pin_map.get(edge_id)
+        if not pin_map:
+            return edge_pos
+
+        effective_pos = edge_pos.clone()
+        for reuse_idx, (base_id, base_idx, scale, offset) in pin_map.items():
+            effective_pos[reuse_idx] = (
+                all_edge_positions[base_id][base_idx] * scale + offset
+            )
+        return effective_pos
+
+    def density_dependency_edge_ids(self, edge_id):
+        """Return edge parameters that can receive gradients from this edge's density."""
+        deps = {edge_id}
+        for _reuse_idx, (base_id, _base_idx, _scale, _offset) in self.reuse_pin_map.get(edge_id, {}).items():
+            deps.add(base_id)
+        return deps
     
     def build_pin_positions(self, all_edge_positions):
         """
         @brief Build global pin_x, pin_y tensors from all edge positions.
-               For reuse edges, positions are derived from their base edge via a
-               translation offset instead of using their own (non-optimized) pos.
+               Mapped reuse pins are derived from their base pins. Edge-local
+               pins use their own edge variables.
         @param all_edge_positions dict mapping edge_id to position tensor for that edge
         @return pin_x, pin_y tensors of all pin coordinates
         """
@@ -413,18 +435,7 @@ class PlaceObj(nn.Module):
         
         for edge_id, edge_place in enumerate(self.edge_places):
             edge = edge_place.edge
-            
-            if edge_id in self.is_reuse_edge:
-                # Reuse edge: derive positions from the base edge + offset.
-                # Stage 2 assumes reuse instances are strict translations of
-                # the same edge geometry; mismatched geometry is a Stage 1
-                # assignment/export bug and is not rescaled here.
-                base_id = self.base_edge_of[edge_id]
-                offset  = self.reuse_offset[edge_id]
-                # base_pos has requires_grad=True; adding a constant keeps the grad_fn
-                edge_pos = all_edge_positions[base_id] + offset
-            else:
-                edge_pos = all_edge_positions[edge_id]  # 1D positions along the edge
+            edge_pos = self.edge_effective_position(edge_id, all_edge_positions)
             
             if edge.direction == 'horizontal':
                 # Horizontal edge: x varies, y = fixed_val
@@ -461,15 +472,12 @@ class PlaceObj(nn.Module):
     def obj_density_test(self, all_edge_positions):
         """
         @brief Compute density only (for testing).
-               Reuse edges share the same density as their base edge and are skipped.
         @param all_edge_positions dict mapping edge_id to position tensor for that edge
-        @return density value (sum of base-edge densities only)
+        @return density value
         """
         density_list = []
         for edge_id, edge_place in enumerate(self.edge_places):
-            if edge_id in self.is_reuse_edge:
-                continue  # density already represented by the base edge
-            edge_pos = all_edge_positions[edge_id]
+            edge_pos = self.edge_effective_position(edge_id, all_edge_positions)
             edge_density = edge_place.op_collections.density_op(edge_pos)
             density_list.append(edge_density)
         
@@ -510,7 +518,7 @@ class PlaceObj(nn.Module):
         compute_grad_metrics: bool = False,
     ) -> Tuple[torch.Tensor, float, float, Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        @brief wl_weight * WL + sum_i w_i * density_i (base edges). Also reports gradient norms.
+        @brief wl_weight * WL + sum_i w_i * density_i. Also reports gradient norms.
         @param density_weight  Scalar (broadcast), length-K vector, or None (use self.density_weight).
         @param compute_per_edge_norms  If True, run per-base-edge density backward for schedule metrics.
         @param compute_grad_metrics  If True, report aggregate WL/Density gradient norms.
@@ -521,6 +529,7 @@ class PlaceObj(nn.Module):
         K = self._num_density_edges
         w = self._normalize_density_weights(density_weight)
         edge_items = list(all_edge_positions.items())
+        edge_tensor_by_id = dict(edge_items)
         edge_tensors = [edge_pos for _, edge_pos in edge_items]
 
         wirelength = self.obj_wl_test(all_edge_positions)
@@ -535,25 +544,30 @@ class PlaceObj(nn.Module):
                 retain_graph=True,
                 allow_unused=True,
             )
+            wl_grad_by_edge = np.zeros(max(all_edge_positions.keys()) + 1, dtype=np.float64)
+            for (edge_id, _), grad in zip(edge_items, wl_grads):
+                if grad is not None:
+                    wl_grad_by_edge[edge_id] = grad.norm(p=2).item() * wl_weight
             if compute_per_edge_norms:
-                max_eid = max(all_edge_positions.keys())
-                wl_per_edge_out = np.zeros(max_eid + 1, dtype=np.float64)
-                for (edge_id, _), grad in zip(edge_items, wl_grads):
-                    if grad is not None:
-                        wl_per_edge_out[edge_id] = grad.norm(p=2).item() * wl_weight
+                wl_per_edge_out = np.zeros_like(wl_grad_by_edge)
+                for edge_id in all_edge_positions.keys():
+                    dep_ids = self.density_dependency_edge_ids(edge_id)
+                    wl_per_edge_out[edge_id] = np.sqrt(
+                        sum(wl_grad_by_edge[dep_id] ** 2 for dep_id in dep_ids)
+                    )
                 wl_grad_norm = float(np.sqrt(np.sum(wl_per_edge_out ** 2)))
             else:
                 wl_grad_norm = float(np.sqrt(sum(
-                    grad.norm(p=2).item() ** 2
-                    for grad in wl_grads
-                    if grad is not None
-                ))) * wl_weight
+                    val ** 2 for val in wl_grad_by_edge
+                )))
 
         if K == 0:
             weighted_density = wirelength * 0.0
         else:
             dens_list = [
-                self.edge_places[eid].op_collections.density_op(all_edge_positions[eid])
+                self.edge_places[eid].op_collections.density_op(
+                    self.edge_effective_position(eid, all_edge_positions)
+                )
                 for eid in self.base_edge_indices
             ]
             dens_stack = torch.stack(dens_list)
@@ -566,16 +580,21 @@ class PlaceObj(nn.Module):
             if compute_per_edge_norms:
                 raw_d_per_edge = np.zeros(K, dtype=np.float64)
                 for ki, eid in enumerate(self.base_edge_indices):
-                    edge_pos = all_edge_positions[eid]
+                    edge_pos = self.edge_effective_position(eid, all_edge_positions)
                     d_i = self.edge_places[eid].op_collections.density_op(edge_pos)
-                    grad = torch.autograd.grad(
+                    dep_ids = sorted(self.density_dependency_edge_ids(eid))
+                    dep_tensors = [edge_tensor_by_id[dep_id] for dep_id in dep_ids]
+                    grads = torch.autograd.grad(
                         d_i,
-                        edge_pos,
+                        dep_tensors,
                         retain_graph=False,
                         allow_unused=True,
-                    )[0]
-                    if grad is not None:
-                        raw_d_per_edge[ki] = grad.norm(p=2).item()
+                    )
+                    raw_d_per_edge[ki] = float(np.sqrt(sum(
+                        grad.norm(p=2).item() ** 2
+                        for grad in grads
+                        if grad is not None
+                    )))
                 w_np = w.detach().cpu().numpy()
                 density_grad_norm = float(np.sqrt(np.sum((w_np * raw_d_per_edge) ** 2)))
             elif compute_grad_metrics and edge_tensors:
@@ -686,14 +705,30 @@ class PlaceObj(nn.Module):
         pw = float(getattr(params, "density_weight", 1.0))
         # Edges with zero WL gradient (e.g. not in any 2+ pin net) would get w_i=0; keep a floor.
         w_floor = max(1e-6 * pw, 1e-12)
+        density_dummy_positions = {}
+        for edge_id, edge_place in enumerate(self.edge_places):
+            density_dummy_positions[edge_id] = (
+                edge_place.pos[0].clone().detach().requires_grad_(True)
+            )
+
         weights = []
         for eid in self.base_edge_indices:
             edge_place = self.edge_places[eid]
-            edge_pos = edge_place.pos[0].clone().detach().requires_grad_(True)
+            for pos in density_dummy_positions.values():
+                pos.grad = None
+            edge_pos = self.edge_effective_position(eid, density_dummy_positions)
             density = edge_place.op_collections.density_op(edge_pos)
             density.backward()
-            dg = edge_pos.grad.norm(p=2).item() if edge_pos.grad is not None else 0.0
-            wl_i = wl_g.get(eid, 0.0)
+            dep_ids = self.density_dependency_edge_ids(eid)
+            dg = float(np.sqrt(sum(
+                density_dummy_positions[dep_eid].grad.norm(p=2).item() ** 2
+                for dep_eid in dep_ids
+                if density_dummy_positions[dep_eid].grad is not None
+            )))
+            wl_i = float(np.sqrt(sum(
+                wl_g.get(dep_eid, 0.0) ** 2
+                for dep_eid in self.density_dependency_edge_ids(eid)
+            )))
             if dg > eps:
                 wi = pw * (wl_i / dg)
                 weights.append(max(wi, w_floor))
