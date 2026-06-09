@@ -4,13 +4,15 @@ PinAssignFlow - Top-level entry point for the complete Pin Assignment flow.
 
 Usage:
     python run.py --case benchmark/case2 --output output/case2
+    python run.py --case benchmark/case2 --output output/case2 --evaluate path/to/evaluate.py
     python run.py --case benchmark/case2 --output output/case2 --skip-mcts --segment-assignments path/to/file.json
-    python run.py --case benchmark/case2 --output output/case2 --skip-mcts --skip-nlplace --result path/to/result.json
+    python run.py --case benchmark/case2 --output output/case2 --skip-mcts --skip-nlplace --result path/to/result.json --segment-assignments path/to/segment_assignments.json --evaluate path/to/evaluate.py
 """
 
 import argparse
 import logging
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -87,6 +89,8 @@ def run_full_flow(
     # Pre-computed intermediate files (when skipping stages)
     segment_assignments_path: str = None,
     result_json_path: str = None,
+    # External evaluation script
+    evaluate_path: str = None,
 ) -> str:
     """Execute the complete Pin Assignment flow.
 
@@ -107,6 +111,8 @@ def run_full_flow(
         skip_legalization: Skip Stage 3.
         segment_assignments_path: Pre-computed segment assignments (when skip_mcts=True).
         result_json_path: Pre-computed result.json (when skip_nlplace=True).
+        evaluate_path: Path to external evaluate.py script. If provided, runs after
+            Stage 2 (before Stage 3) and again after Stage 3 completes.
 
     Returns:
         Path to the final result file.
@@ -190,6 +196,25 @@ def run_full_flow(
     logging.info(f"Stage 2 elapsed: {t_stage2 - t_stage1:.1f}s")
 
     # ------------------------------------------------------------------
+    # Evaluate (post-Stage 2)
+    # ------------------------------------------------------------------
+    if evaluate_path:
+        ftpred_path = os.path.join(PROJECT_ROOT, "stage1_mcts", "feedthrough", "build", "ftpred")
+        logging.info(f"[Evaluate @ post-Stage2] Running: {evaluate_path}")
+        try:
+            result = subprocess.run(
+                [sys.executable, evaluate_path, result_path, block_json, result_path, ftpred_path],
+                capture_output=False,
+                check=False,
+            )
+            if result.returncode == 0:
+                logging.info(f"[Evaluate @ post-Stage2] Done (exit 0)")
+            else:
+                logging.warning(f"[Evaluate @ post-Stage2] Exited with code {result.returncode}")
+        except Exception as e:
+            logging.error(f"[Evaluate @ post-Stage2] Failed: {e}")
+
+    # ------------------------------------------------------------------
     # Stage 3: QP Legalization
     # ------------------------------------------------------------------
     if not skip_legalization:
@@ -203,6 +228,7 @@ def run_full_flow(
             keepout=keepout,
             hpwl_thresh=hpwl_thresh,
             max_outer_iter=max_outer_iter,
+            segment_assignments_json=seg_assign_path,
         )
     else:
         final_path = result_path
@@ -210,6 +236,25 @@ def run_full_flow(
 
     t_stage3 = time.time()
     logging.info(f"Stage 3 elapsed: {t_stage3 - t_stage2:.1f}s")
+
+    # ------------------------------------------------------------------
+    # Evaluate (post-Stage 3)
+    # ------------------------------------------------------------------
+    if evaluate_path:
+        ftpred_path = os.path.join(PROJECT_ROOT, "stage1_mcts", "feedthrough", "build", "ftpred")
+        logging.info(f"[Evaluate @ post-Stage3] Running: {evaluate_path}")
+        try:
+            result = subprocess.run(
+                [sys.executable, evaluate_path, final_path, block_json, final_path, ftpred_path],
+                capture_output=False,
+                check=False,
+            )
+            if result.returncode == 0:
+                logging.info(f"[Evaluate @ post-Stage3] Done (exit 0)")
+            else:
+                logging.warning(f"[Evaluate @ post-Stage3] Exited with code {result.returncode}")
+        except Exception as e:
+            logging.error(f"[Evaluate @ post-Stage3] Failed: {e}")
 
     # ------------------------------------------------------------------
     # Summary
@@ -233,13 +278,24 @@ Examples:
   # Run full flow
   python run.py --case benchmark/case2 --output output/case2
 
+  # Run full flow with external evaluate script
+  python run.py --case benchmark/case2 --output output/case2 \\
+      --evaluate path/to/evaluate.py
+
   # Skip MCTS, use existing segment assignments
   python run.py --case benchmark/case2 --output output/case2 \\
       --skip-mcts --segment-assignments path/to/segment_assignments.json
 
-  # Only run legalization on existing result
+  # Only run legalization on existing result; pass segment assignments explicitly
   python run.py --case benchmark/case2 --output output/case2 \\
-      --skip-mcts --skip-nlplace --result path/to/result.json
+      --skip-mcts --skip-nlplace --result path/to/result.json \\
+      --segment-assignments path/to/segment_assignments.json
+
+  # Same as above, with evaluate
+  python run.py --case benchmark/case2 --output output/case2 \\
+      --skip-mcts --skip-nlplace --result path/to/result.json \\
+      --segment-assignments path/to/segment_assignments.json \\
+      --evaluate path/to/evaluate.py
 """,
     )
 
@@ -280,6 +336,15 @@ Examples:
         help="Directory for per-run log files (default: <output>/logs)",
     )
 
+    parser.add_argument(
+        "--evaluate",
+        type=str,
+        default=None,
+        dest="evaluate_path",
+        help="Path to external evaluate.py script. If provided, runs after Stage 2 "
+             "(before Stage 3) and again after Stage 3 completes.",
+    )
+
     args = parser.parse_args()
 
     log_file, log_path, original_stdout, original_stderr = setup_logging(
@@ -303,6 +368,7 @@ Examples:
             skip_legalization=args.skip_legalization,
             segment_assignments_path=args.segment_assignments,
             result_json_path=args.result,
+            evaluate_path=args.evaluate_path,
         )
 
         print(f"\nFinal result: {final_path}")
