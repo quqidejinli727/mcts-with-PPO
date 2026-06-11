@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+output/
+outputs/
+run_results/
+mcts_result/
+*.log
+stage1_mcts/feedthrough/build/
+stage1_mcts/feedthrough_predict/build/
+stage1_mcts/feedthrough_evaluate/build/
+stage1_mcts/feedthrough/etc/
